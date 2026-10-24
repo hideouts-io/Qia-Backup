@@ -1,0 +1,28 @@
+[workspace]
+
+[package]
+name = "qia-backup-app"
+version = "0.1.0"
+edition = "2024"
+description = "Tauri desktop shell for Qia Backup"
+license = "MIT"
+
+[lib]
+name = "qia_backup_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qia-backup"
+path = "src/main.rs"
+
+[dependencies]
+qia_backup = { package = "qia-backup", path = ".." }
+tauri = { version = "2.12", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+parking_lot = "0.12"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

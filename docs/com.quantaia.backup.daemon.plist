@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.quantaia.backup.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/qia-backupctl</string>
+    <string>daemon</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/qia-backup-daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/qia-backup-daemon.err.log</string>
+</dict>
+</plist>
