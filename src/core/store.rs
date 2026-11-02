@@ -249,6 +249,14 @@ struct RequestTarget {
     canonical_query: String,
 }
 
+/// A completed S3 request. Headers are kept because `HEAD` responses carry
+/// the object size in `Content-Length` and no body at all.
+struct S3Response {
+    status: u16,
+    body: Vec<u8>,
+    headers: reqwest::header::HeaderMap,
+}
+
 impl S3Store {
     pub fn new(config: S3Config) -> Result<Self> {
         if config.bucket.is_empty() {
@@ -405,7 +413,7 @@ impl S3Store {
         query: &[(String, String)],
         body: Option<&[u8]>,
         extra_headers: &[(String, String)],
-    ) -> Result<(u16, Vec<u8>)> {
+    ) -> Result<S3Response> {
         let target = self.target(key, query)?;
         let body_bytes = body.unwrap_or(&[]);
         let payload_hash = sha256_hex(body_bytes);
@@ -434,8 +442,8 @@ impl S3Store {
             match req.send() {
                 Ok(response) => {
                     let status = response.status().as_u16();
-                    let response_date = response
-                        .headers()
+                    let response_headers = response.headers().clone();
+                    let response_date = response_headers
                         .get(reqwest::header::DATE)
                         .and_then(|value| value.to_str().ok())
                         .and_then(|value| DateTime::parse_from_rfc2822(value).ok())
@@ -483,7 +491,11 @@ impl S3Store {
                         }
                         return Err(BackupError::S3(last_error));
                     }
-                    return Ok((status, bytes));
+                    return Ok(S3Response {
+                        status,
+                        body: bytes,
+                        headers: response_headers,
+                    });
                 }
                 Err(e) => {
                     last_error = format!("network error: {e}");
@@ -528,11 +540,11 @@ impl S3Store {
         if let Some(token) = continuation {
             query.push(("continuation-token".to_string(), token.to_string()));
         }
-        let (status, body) = self.execute("GET", "", &query, None, &[])?;
-        if status != 200 {
-            return Err(self.describe_error("list", prefix, status, &body));
+        let response = self.execute("GET", "", &query, None, &[])?;
+        if response.status != 200 {
+            return Err(self.describe_error("list", prefix, response.status, &response.body));
         }
-        let text = String::from_utf8_lossy(&body);
+        let text = String::from_utf8_lossy(&response.body);
         let parsed: ListBucketResult = quick_xml::de::from_str(&text)
             .map_err(|e| BackupError::S3(format!("parsing ListObjectsV2: {e}")))?;
         Ok(ListPage {
@@ -553,9 +565,9 @@ impl S3Store {
 
 impl BlobStore for S3Store {
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        let (status, body) = self.execute("PUT", key, &[], Some(data), &[])?;
-        if !(200..300).contains(&status) {
-            return Err(self.describe_error("PUT", key, status, &body));
+        let response = self.execute("PUT", key, &[], Some(data), &[])?;
+        if !(200..300).contains(&response.status) {
+            return Err(self.describe_error("PUT", key, response.status, &response.body));
         }
         Ok(())
     }
@@ -571,11 +583,11 @@ impl BlobStore for S3Store {
     }
 
     fn get_opt(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let (status, body) = self.execute("GET", key, &[], None, &[])?;
-        match status {
-            200 => Ok(Some(body)),
+        let response = self.execute("GET", key, &[], None, &[])?;
+        match response.status {
+            200 => Ok(Some(response.body)),
             404 => Ok(None),
-            _ => Err(self.describe_error("GET", key, status, &body)),
+            _ => Err(self.describe_error("GET", key, response.status, &response.body)),
         }
     }
 
@@ -588,16 +600,16 @@ impl BlobStore for S3Store {
             .and_then(|v| v.checked_sub(1))
             .ok_or_else(|| BackupError::Store("blob range overflow".into()))?;
         let headers = vec![("range".to_string(), format!("bytes={offset}-{end}"))];
-        let (status, body) = self.execute("GET", key, &[], None, &headers)?;
-        match status {
+        let response = self.execute("GET", key, &[], None, &headers)?;
+        match response.status {
             206 => {
-                if body.len() as u64 != length {
+                if response.body.len() as u64 != length {
                     return Err(BackupError::S3(format!(
                         "GET {key} returned {} bytes for range {offset}..{end}, expected {length}",
-                        body.len()
+                        response.body.len()
                     )));
                 }
-                Ok(body)
+                Ok(response.body)
             }
             200 => {
                 // Some S3-compatible endpoints ignore Range. Fall back to
@@ -606,16 +618,21 @@ impl BlobStore for S3Store {
                 let finish = start
                     .checked_add(length as usize)
                     .ok_or_else(|| BackupError::Store("blob range overflow".into()))?;
-                if finish > body.len() {
-                    return Err(self.describe_error("GET range", key, status, &body));
+                if finish > response.body.len() {
+                    return Err(self.describe_error(
+                        "GET range",
+                        key,
+                        response.status,
+                        &response.body,
+                    ));
                 }
-                Ok(body[start..finish].to_vec())
+                Ok(response.body[start..finish].to_vec())
             }
             404 => Err(BackupError::S3(format!(
                 "object not found: {key} ({})",
                 self.describe()
             ))),
-            _ => Err(self.describe_error("GET range", key, status, &body)),
+            _ => Err(self.describe_error("GET range", key, response.status, &response.body)),
         }
     }
 
@@ -672,28 +689,20 @@ impl BlobStore for S3Store {
     }
 
     fn head(&self, key: &str) -> Result<Option<ObjectInfo>> {
-        let (status, body) = self.execute("HEAD", key, &[], None, &[])?;
-        match status {
-            200 => {
-                // HEAD has no body, so size is looked up with a ranged GET if
-                // needed; callers use this mostly for existence checks.
-                Ok(Some(ObjectInfo {
-                    key: key.to_string(),
-                    size: 0,
-                    etag: None,
-                }))
-            }
+        let response = self.execute("HEAD", key, &[], None, &[])?;
+        match response.status {
+            200 => Ok(Some(object_info_from_headers(key, &response.headers))),
             404 => Ok(None),
-            _ => Err(self.describe_error("HEAD", key, status, &body)),
+            _ => Err(self.describe_error("HEAD", key, response.status, &response.body)),
         }
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        let (status, body) = self.execute("DELETE", key, &[], None, &[])?;
-        if (200..300).contains(&status) || status == 404 {
+        let response = self.execute("DELETE", key, &[], None, &[])?;
+        if (200..300).contains(&response.status) || response.status == 404 {
             Ok(())
         } else {
-            Err(self.describe_error("DELETE", key, status, &body))
+            Err(self.describe_error("DELETE", key, response.status, &response.body))
         }
     }
 
@@ -747,6 +756,26 @@ struct ListPage {
     objects: Vec<ObjectInfo>,
     next: Option<String>,
     is_truncated: bool,
+}
+
+/// Build object metadata from a `HEAD` response. `Content-Length` is the
+/// object size; returning a placeholder zero here makes callers reject valid
+/// packed objects whose record references a non-zero byte range.
+fn object_info_from_headers(key: &str, headers: &reqwest::header::HeaderMap) -> ObjectInfo {
+    let size = headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let etag = headers
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    ObjectInfo {
+        key: key.to_string(),
+        size,
+        etag,
+    }
 }
 
 /// If `body` is S3's `RequestTimeTooSkewed` error, return the server time it
@@ -890,6 +919,22 @@ mod tests {
             auth,
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=d717e625459e73ca59996a42c07b4ac75570844f087bec7536dcd4bdde17b18f"
         );
+    }
+
+    #[test]
+    fn head_metadata_uses_content_length() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::HeaderValue::from_static("7818576"),
+        );
+        headers.insert(
+            reqwest::header::ETAG,
+            reqwest::header::HeaderValue::from_static("\"abc\""),
+        );
+        let info = object_info_from_headers("blobpacks/test.blobpack", &headers);
+        assert_eq!(info.size, 7_818_576);
+        assert_eq!(info.etag.as_deref(), Some("\"abc\""));
     }
 
     #[test]
