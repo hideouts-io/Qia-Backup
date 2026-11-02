@@ -114,6 +114,36 @@ fn load_record_with_keys(
     Ok((keys, record, key))
 }
 
+/// Resolve a path inside a record. Returns `None` when the path (or one of its
+/// parents) is absent, while still surfacing real I/O or decoding errors.
+pub(crate) fn find_node_opt(
+    store: &dyn BlobStore,
+    root: &str,
+    keys: Option<&MasterKeys>,
+    rec: &BackupRecord,
+    path: &str,
+) -> Result<Option<Node>> {
+    let mut node = rec.root_node()?;
+    for component in path_components(path)? {
+        if !node.is_tree {
+            return Ok(None);
+        }
+        let Some(loc) = node.tree_blob_loc.as_ref() else {
+            return Ok(None);
+        };
+        let tree = record::load_tree_checked(store, root, loc, keys)?;
+        match tree
+            .children
+            .into_iter()
+            .find(|(name, _)| name == &component)
+        {
+            Some((_, child)) => node = child,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(node))
+}
+
 fn find_node(
     store: &dyn BlobStore,
     root: &str,
@@ -121,26 +151,8 @@ fn find_node(
     rec: &BackupRecord,
     path: &str,
 ) -> Result<Node> {
-    let mut node = rec.root_node()?;
-    for component in path_components(path)? {
-        if !node.is_tree {
-            return Err(BackupError::Other(format!(
-                "backup path is not a directory: {path}"
-            )));
-        }
-        let loc = node
-            .tree_blob_loc
-            .as_ref()
-            .ok_or_else(|| BackupError::Codec("directory node has no tree location".into()))?;
-        let tree = record::load_tree_checked(store, root, loc, keys)?;
-        node = tree
-            .children
-            .into_iter()
-            .find(|(name, _)| name == &component)
-            .map(|(_, child)| child)
-            .ok_or_else(|| BackupError::Other(format!("backup path not found: {path}")))?;
-    }
-    Ok(node)
+    find_node_opt(store, root, keys, rec, path)?
+        .ok_or_else(|| BackupError::Other(format!("backup path not found: {path}")))
 }
 
 /// List the contents of a backed-up directory for the file explorer. Passing

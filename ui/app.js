@@ -58,6 +58,20 @@ const state = {
   filesActionBusy: false,
   filesError: "",
   filesNotice: "",
+  versionCounts: {},
+  versionCountsLoading: false,
+  versionCountsPath: "",
+  versionCountsRequest: 0,
+  versionCountsCache: new Map(),
+  restorePath: "",
+  restorePartial: false,
+  restoreVersions: [],
+  restoreSelectedKey: "",
+  restoreError: "",
+  restoreLoading: false,
+  restoreRequest: 0,
+  fileDiff: null,
+  fileDiffRequest: 0,
   storageEstimate: null,
   estimateAt: 0,
   estimateError: "",
@@ -623,7 +637,7 @@ function backupRow(entry, withRecord = false) {
     <td>
       <button class="link-button" data-diff="${esc(entry.key)}">Changes</button>
       <button class="link-button" data-files-browse="${esc(entry.key)}">Browse</button>
-      <button class="link-button" data-restore="${esc(entry.key)}">Restore</button>
+      <button class="link-button" data-restore="${esc(entry.key)}" title="Open the Files view to choose a destination and restore">Restore…</button>
     </td>
   </tr>`;
 }
@@ -650,6 +664,12 @@ function renderBackups() {
       $("files-filter").value = "";
       $("files-dest").value = $("files-dest").value || state.restoreDestination;
       showView("files");
+      window.setTimeout(() => {
+        const dest = $("files-dest");
+        if (!dest) return;
+        dest.scrollIntoView({ behavior: "smooth", block: "center" });
+        dest.focus();
+      }, 60);
     });
   });
   document.querySelectorAll("[data-diff]").forEach((btn) => {
@@ -743,6 +763,79 @@ function updateFilesNote() {
   }
 }
 
+function setVersionStatus(text) {
+  const el = $("files-version-status");
+  if (!el) return;
+  el.textContent = text || "";
+  el.classList.toggle("hidden", !text);
+}
+
+function backupsSignature() {
+  return (state.backups || [])
+    .map((b) => `${b.key}:${b.size || 0}:${b.isComplete === false ? 0 : 1}`)
+    .join("|");
+}
+
+function resetVersionCounts() {
+  state.versionCounts = {};
+  state.versionCountsLoading = false;
+  state.versionCountsPath = state.filesPath || "";
+  state.versionCountsRequest += 1;
+  setVersionStatus("");
+}
+
+async function refreshVersionCounts() {
+  const path = state.filesPath || "";
+  if (demo || !invoke || !state.config?.bucket || state.filesRecordKey === "partial") {
+    resetVersionCounts();
+    renderFiles();
+    return;
+  }
+  const cacheKey = `${backupsSignature()}::${path}`;
+  if (state.versionCountsCache.has(cacheKey)) {
+    state.versionCounts = state.versionCountsCache.get(cacheKey);
+    state.versionCountsPath = path;
+    state.versionCountsLoading = false;
+    state.versionCountsRequest += 1;
+    setVersionStatus("");
+    renderFiles();
+    return;
+  }
+  const requestId = ++state.versionCountsRequest;
+  state.versionCounts = {};
+  state.versionCountsPath = path;
+  state.versionCountsLoading = true;
+  const backups = state.backups.length;
+  setVersionStatus(`Counting versions across ${backups} completed backup${backups === 1 ? "" : "s"}…`);
+  renderFiles();
+  try {
+    const result = await invoke("backup_version_counts", { path });
+    if (requestId !== state.versionCountsRequest || state.filesPath !== path) return;
+    const counts = {};
+    for (const entry of result.counts || []) {
+      counts[entry.path] = Number(entry.versions || 0);
+    }
+    state.versionCounts = counts;
+    state.versionCountsCache.set(cacheKey, counts);
+    if (state.versionCountsCache.size > 80) {
+      const oldest = state.versionCountsCache.keys().next().value;
+      state.versionCountsCache.delete(oldest);
+    }
+    setVersionStatus("");
+  } catch (_) {
+    if (requestId === state.versionCountsRequest) {
+      state.versionCounts = {};
+      setVersionStatus("Version counts are unavailable.");
+    }
+  } finally {
+    if (requestId === state.versionCountsRequest) {
+      state.versionCountsLoading = false;
+      renderFiles();
+    }
+  }
+}
+
+
 function renderFilesBreadcrumb() {
   const el = $("files-breadcrumb");
   if (!el) return;
@@ -767,27 +860,44 @@ function renderFiles() {
   $("files-restore-all").title = actionBusy || state.status?.editing
     ? "Wait for the current file action to finish"
     : restoreBlocked ? "Stop the active backup or restore before restoring" : "";
+  const selectedRecord = partial
+    ? null
+    : (state.backups.find((entry) => entry.key === state.filesRecordKey) || state.backups[0]);
+  if (!partial && selectedRecord) {
+    $("files-restore-all").title = `Restore every file from the ${fmtDate(selectedRecord.timestamp)} backup`;
+  }
+  if ($("files-revision-date")) {
+    $("files-revision-date").textContent = partial
+      ? (state.status?.running ? "In progress" : "Stopped run")
+      : (selectedRecord ? fmtDate(selectedRecord.timestamp) : "—");
+    $("files-revision-files").textContent = partial
+      ? (state.status?.running ? `${Number(state.status?.files || 0).toLocaleString()} so far` : "—")
+      : (selectedRecord ? Number(selectedRecord.filesCount || 0).toLocaleString() : "—");
+    $("files-revision-uploaded").textContent = partial
+      ? (state.status?.running ? fmtBytes(state.status?.bytesUploaded) : "—")
+      : (selectedRecord ? fmtBytes(selectedRecord.bytesUploaded) : "—");
+  }
   if ($("files-refresh")) $("files-refresh").disabled = actionBusy;
   if ($("files-record")) $("files-record").disabled = actionBusy;
   $("files-up").disabled = !state.filesPath || actionBusy;
   renderFilesBreadcrumb();
   if (state.filesLoading) {
-    body.innerHTML = '<tr><td colspan="5" class="empty">Loading backup files…</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="empty">Loading backup files…</td></tr>';
     return;
   }
   if (state.filesError) {
-    body.innerHTML = `<tr><td colspan="5" class="empty">${esc(state.filesError)}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" class="empty">${esc(state.filesError)}</td></tr>`;
     return;
   }
   if (state.filesNotice && !state.filesEntries.length) {
-    body.innerHTML = `<tr><td colspan="5" class="empty">${esc(state.filesNotice)}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" class="empty">${esc(state.filesNotice)}</td></tr>`;
     return;
   }
   const filter = (state.filesFilter || "").trim().toLowerCase();
   const entries = (state.filesEntries || []).filter((e) => !filter || e.name.toLowerCase().includes(filter));
   if (!entries.length) {
     const message = state.filesEntries.length ? "No matching entries." : "This folder is empty.";
-    body.innerHTML = `<tr><td colspan="5" class="empty">${message}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" class="empty">${message}</td></tr>`;
     return;
   }
   body.innerHTML = entries.map((entry) => {
@@ -798,9 +908,20 @@ function renderFiles() {
       : `<span>${esc(entry.name)}</span>`;
     const size = entry.isDir ? `${Number(entry.filesCount || 0).toLocaleString()} files` : fmtBytes(entry.size);
     const modified = entry.mtimeSec ? esc(fmtDate(Number(entry.mtimeSec) * 1000)) : "—";
+    const versionCount = state.versionCounts[entry.path];
+    let versionsCell;
+    if (entry.isDir || partial) {
+      versionsCell = `<td class="versions-cell muted" title="${partial ? "Version history is available for completed backups" : "Folders do not have individual versions"}">—</td>`;
+    } else if (versionCount != null) {
+      versionsCell = `<td class="versions-cell"><button class="version-badge" type="button" data-files-versions="${esc(entry.path)}" title="${versionCount} version${versionCount === 1 ? "" : "s"} across completed backups — view and restore">${versionCount}</button></td>`;
+    } else if (state.versionCountsLoading && state.versionCountsPath === state.filesPath) {
+      versionsCell = '<td class="versions-cell"><span class="version-loading" title="Counting versions across completed backups…">…</span></td>';
+    } else {
+      versionsCell = '<td class="versions-cell muted">—</td>';
+    }
     const restore = restoreBlocked
       ? '<button class="link-button" type="button" disabled title="Stop the active backup or restore before restoring">Restore</button>'
-      : `<button class="link-button" type="button" data-files-restore="${esc(entry.path)}">Restore</button>`;
+      : `<button class="link-button" type="button" data-files-restore="${esc(entry.path)}" title="Choose which version to restore">Restore</button>`;
     const ignore = actionBusy
       ? '<button class="link-button" type="button" disabled title="Wait for the current file action to finish">Ignore</button>'
       : `<button class="link-button" type="button" data-files-ignore="${esc(entry.path)}">Ignore</button>`;
@@ -818,6 +939,7 @@ function renderFiles() {
       <td>${kind}</td>
       <td>${size}</td>
       <td>${modified}</td>
+      ${versionsCell}
       <td><div class="files-actions">${restore}${ignore}${remove}</div></td>
     </tr>`;
   }).join("");
@@ -831,6 +953,7 @@ async function refreshFiles() {
       ? "Preview mode — the file explorer needs the macOS build."
       : "Configure the S3 destination in Settings first.";
     state.filesNotice = "";
+    resetVersionCounts();
     renderFilesRecords();
     renderFiles();
     return;
@@ -840,6 +963,7 @@ async function refreshFiles() {
   state.filesEntries = [];
   state.filesError = "";
   state.filesNotice = "";
+  resetVersionCounts();
   renderFiles();
   // Always re-read the record list. A stale in-memory backup list must never
   // make deleted records or a cleared bucket look like they still exist.
@@ -892,6 +1016,7 @@ async function refreshFiles() {
     state.filesNotice = state.status?.running
       ? "A backup is running. Partial files will appear as the first directories complete."
       : "No backup data in the destination. Run a backup first.";
+    resetVersionCounts();
     renderFiles();
     return;
   }
@@ -913,6 +1038,7 @@ async function refreshFiles() {
     if (requestId === state.filesRequest) {
       state.filesLoading = false;
       renderFiles();
+      if (!state.filesError) refreshVersionCounts();
     }
   }
 }
@@ -988,16 +1114,151 @@ async function removeFilesEntry(path) {
   }
 }
 
-async function restoreFilesEntry(path) {
+function restoreDestinationValue() {
+  return ($("files-dest").value || "").trim() || state.restoreDestination;
+}
+
+function renderRestoreVersions() {
+  const list = $("restore-versions");
+  const confirm = $("restore-confirm");
+  if (!list || !confirm) return;
+  if (state.restoreLoading) {
+    list.innerHTML = '<div class="version-empty">Loading versions…</div>';
+    confirm.disabled = true;
+    return;
+  }
+  if (state.restoreError) {
+    list.innerHTML = `<div class="version-empty">${esc(state.restoreError)}</div>`;
+    confirm.disabled = true;
+    return;
+  }
+  const versions = state.restoreVersions || [];
+  if (!versions.length) {
+    list.innerHTML = '<div class="version-empty">No versions of this path were found in completed backups.</div>';
+    confirm.disabled = true;
+    return;
+  }
+  if (!versions.some((version) => version.partial)) {
+    $("restore-meta").textContent = `${versions.length} version${versions.length === 1 ? "" : "s"} available. Pick the point in time you want this path restored from.`;
+  }
+  list.innerHTML = versions.map((version, index) => {
+    const selected = version.recordKey === state.restoreSelectedKey;
+    if (version.partial) {
+      return `<label class="version-row selected">
+        <input type="radio" name="restore-version" value="partial" checked />
+        <span class="version-main">
+          <span class="version-date">Partial backup (current app session)</span>
+          <span class="version-detail">Restores content already uploaded; files still queued may be skipped.</span>
+        </span>
+      </label>`;
+    }
+    const size = version.isDir ? "Folder" : fmtBytes(version.size);
+    const occurrences = Number(version.occurrences || 1);
+    const label = index === 0 ? "Latest" : `Version ${versions.length - index}`;
+    const viewing = selected && index !== 0 ? '<span class="pill ok">Viewing</span>' : "";
+    return `<label class="version-row${selected ? " selected" : ""}">
+      <input type="radio" name="restore-version" value="${esc(version.recordKey)}" ${selected ? "checked" : ""} />
+      <span class="version-main">
+        <span class="version-date">${esc(fmtDate(version.timestamp))}</span>
+        <span class="version-detail">${size} · seen in ${occurrences} backup${occurrences === 1 ? "" : "s"}</span>
+      </span>
+      <span class="version-badges"><span class="pill">${label}</span>${viewing}</span>
+    </label>`;
+  }).join("");
+  confirm.disabled = !state.restoreSelectedKey;
+}
+
+async function pickRestoreDestination(inputId) {
+  if (demo) return toast("Preview mode — use the macOS app to choose a folder.");
+  try {
+    const current = ($(inputId)?.value || "").trim();
+    const picked = await invoke("pick_restore_destination", { current: current || null });
+    if (picked) $(inputId).value = picked;
+  } catch (e) {
+    toast(String(e), true);
+  }
+}
+
+function closeRestoreDialog() {
+  state.restoreRequest += 1;
+  $("restore-modal").classList.add("hidden");
+}
+
+async function openRestoreDialog(path) {
   if (demo || !invoke) return toast("Preview mode — restore is not available.", true);
   const partial = state.filesRecordKey === "partial";
   if (partial && state.status?.running) {
     return toast("Stop the backup before restoring from partial data.", true);
   }
-  const destination = ($("files-dest").value || "").trim() || state.restoreDestination;
+  const requestId = ++state.restoreRequest;
+  state.restorePath = path || "";
+  state.restorePartial = partial;
+  state.restoreVersions = [];
+  state.restoreSelectedKey = "";
+  state.restoreError = "";
+  state.restoreLoading = true;
+  $("restore-modal").classList.remove("hidden");
+  $("restore-title").textContent = partial ? "Restore from partial backup" : "Choose a version to restore";
+  $("restore-meta").textContent = partial
+    ? "Only content that has already been uploaded can be restored."
+    : "Pick the point in time you want this path restored from.";
+  $("restore-target").textContent = path || "Entire backup";
+  $("restore-dest").value = restoreDestinationValue();
+  renderRestoreVersions();
+
+  if (partial) {
+    state.restoreVersions = [{
+      recordKey: "partial",
+      timestamp: null,
+      size: 0,
+      occurrences: 1,
+      selected: true,
+      partial: true,
+      isDir: false,
+    }];
+    state.restoreSelectedKey = "partial";
+    state.restoreLoading = false;
+    renderRestoreVersions();
+    window.setTimeout(() => {
+      $("restore-versions")?.querySelector('input:checked')?.focus();
+    }, 0);
+    return;
+  }
+
+  try {
+    const result = await invoke("backup_file_versions", {
+      path: state.restorePath,
+      atRecord: state.filesRecordKey || null,
+    });
+    if (requestId !== state.restoreRequest) return;
+    state.restoreVersions = result.versions || [];
+    const selected = state.restoreVersions.find((version) => version.selected) || state.restoreVersions[0];
+    state.restoreSelectedKey = selected ? selected.recordKey : "";
+  } catch (e) {
+    if (requestId !== state.restoreRequest) return;
+    state.restoreError = String(e);
+  } finally {
+    if (requestId === state.restoreRequest) {
+      state.restoreLoading = false;
+      renderRestoreVersions();
+      window.setTimeout(() => {
+        $("restore-versions")?.querySelector('input:checked')?.focus();
+      }, 0);
+    }
+  }
+}
+
+async function restoreSelectedVersion() {
+  if (demo || !invoke) return toast("Preview mode — restore is not available.", true);
+  if (!state.restoreSelectedKey) return toast("Choose a version first.", true);
+  const destination = ($("restore-dest").value || "").trim() || state.restoreDestination;
   if (!destination) return toast("Choose a destination folder first.", true);
+  const path = state.restorePath || "";
+  const partial = state.restorePartial;
+  $("files-dest").value = destination;
+  closeRestoreDialog();
   $("files-progress").classList.remove("hidden");
-  $("files-phase").textContent = `Restoring ${path}…`;
+  $("files-phase").textContent = path ? `Restoring ${path}…` : "Restoring backup…";
   $("files-stats").textContent = "";
   $("files-cancel").classList.remove("hidden");
   try {
@@ -1005,7 +1266,7 @@ async function restoreFilesEntry(path) {
       await invoke("restore_partial_entry", { path, destination });
     } else {
       await invoke("restore_backup_entry", {
-        recordKey: state.filesRecordKey || null,
+        recordKey: state.restoreSelectedKey,
         path,
         destination,
       });
@@ -1024,8 +1285,16 @@ async function restoreEntireFiles() {
     return toast("Stop the backup before restoring from partial data.", true);
   }
   if (!partial && !state.backups.length) return toast("No completed backup is available yet.", true);
-  const destination = ($("files-dest").value || "").trim() || state.restoreDestination;
+  const destination = restoreDestinationValue();
   if (!destination) return toast("Choose a destination folder first.", true);
+  if (!partial) {
+    const record = state.backups.find((entry) => entry.key === state.filesRecordKey) || state.backups[0];
+    const when = record ? fmtDate(record.timestamp) : "latest backup";
+    const ok = window.confirm(
+      `Restore every file from the ${when} backup into:\n${destination}\n\nExisting files may be overwritten.`
+    );
+    if (!ok) return;
+  }
   $("files-progress").classList.remove("hidden");
   $("files-phase").textContent = partial ? "Restoring partial backup…" : "Starting whole backup restore…";
   $("files-stats").textContent = "";
@@ -1063,17 +1332,21 @@ function renderDiff() {
   });
   const body = $("diff-table").querySelector("tbody");
   if (!entries.length) {
-    body.innerHTML = `<tr><td colspan="4" class="empty">${d.entries?.length ? "No changes match this filter." : "No changes between these records."}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="5" class="empty">${d.entries?.length ? "No changes match this filter." : "No changes between these records."}</td></tr>`;
   } else {
     body.innerHTML = entries.map((entry) => {
       const previous = entry.change === "modified" && entry.previousSize != null
         ? ` <span class="muted">(was ${fmtBytes(entry.previousSize)})</span>`
+        : "";
+      const diffAction = entry.kind === "file"
+        ? `<button class="link-button" type="button" data-diff-file="${esc(entry.path)}">Side-by-side</button>`
         : "";
       return `<tr>
         <td>${diffKindPill(entry.change)}</td>
         <td>${esc(entry.kind)}</td>
         <td>${fmtBytes(entry.size)}${previous}</td>
         <td class="mono path">${esc(entry.path)}</td>
+        <td>${diffAction}</td>
       </tr>`;
     }).join("");
   }
@@ -1094,7 +1367,7 @@ async function openDiff(key) {
   $("diff-meta").textContent = "Loading record trees from S3…";
   $("diff-counts").textContent = "";
   $("diff-table").querySelector("tbody").innerHTML =
-    '<tr><td colspan="4" class="empty">Loading changes…</td></tr>';
+    '<tr><td colspan="5" class="empty">Loading changes…</td></tr>';
   try {
     const result = await invoke("diff_backup", { record: key, previous: null, limit: 5000 });
     state.diff = result;
@@ -1105,7 +1378,7 @@ async function openDiff(key) {
   } catch (e) {
     $("diff-meta").textContent = "Could not load changes.";
     $("diff-table").querySelector("tbody").innerHTML =
-      `<tr><td colspan="4" class="empty">${esc(e)}</td></tr>`;
+      `<tr><td colspan="5" class="empty">${esc(e)}</td></tr>`;
   }
 }
 
@@ -1113,6 +1386,90 @@ function closeDiff() {
   $("diff-modal").classList.add("hidden");
   state.diff = null;
   state.diffRecord = null;
+}
+
+function closeFileDiff() {
+  state.fileDiffRequest += 1;
+  $("file-diff-modal").classList.add("hidden");
+  state.fileDiff = null;
+}
+
+function renderFileDiff(diff) {
+  const leftLabel = diff.previousTimestamp
+    ? `Older — ${fmtDate(diff.previousTimestamp)}`
+    : "Older version";
+  const rightLabel = `Newer — ${fmtDate(diff.recordTimestamp)}`;
+  $("file-diff-title").textContent = diff.path;
+  $("file-diff-meta").textContent = diff.previousTimestamp
+    ? `Comparing ${fmtDate(diff.previousTimestamp)} with ${fmtDate(diff.recordTimestamp)}.`
+    : "No older version exists; the file is shown as added.";
+  const note = $("file-diff-note");
+  const rows = diff.rows || [];
+  if (!rows.length) {
+    note.textContent = "";
+    note.classList.add("hidden");
+    $("file-diff-legend").classList.add("hidden");
+    const excluded = diff.binary || /too large/i.test(diff.message || "");
+    $("file-diff-body").innerHTML = `<div class="diff-unavailable">
+      <div class="diff-unavailable-icon" aria-hidden="true">≠</div>
+      <p>${esc(diff.message || "There is no text content to show for this file.")}</p>
+      ${excluded ? '<span class="muted small">Binary and large files are intentionally excluded from side-by-side diffs.</span>' : ""}
+    </div>`;
+    return;
+  }
+  $("file-diff-legend").classList.remove("hidden");
+  if (diff.message) {
+    note.textContent = diff.message;
+    note.classList.remove("hidden");
+  } else {
+    note.textContent = "";
+    note.classList.add("hidden");
+  }
+  const added = rows.filter((row) => row.kind !== "same" && row.right != null).length;
+  const removed = rows.filter((row) => row.kind !== "same" && row.left != null).length;
+  if (added || removed) {
+    $("file-diff-meta").textContent += ` · +${added} −${removed}`;
+  }
+  const cell = (text) => (text == null || text === "" ? "&nbsp;" : esc(text));
+  const rowHtml = diff.rows.map((row) => {
+    const kind = row.kind || "same";
+    return `<tr class="${esc(kind)}">
+      <td class="ln ln-left${row.left == null ? " empty" : ""}">${row.leftNumber ?? ""}</td>
+      <td class="code left-code${row.left == null ? " empty" : ""}">${cell(row.left)}</td>
+      <td class="ln ln-right${row.right == null ? " empty" : ""}">${row.rightNumber ?? ""}</td>
+      <td class="code right-code${row.right == null ? " empty" : ""}">${cell(row.right)}</td>
+    </tr>`;
+  }).join("");
+  $("file-diff-body").innerHTML =
+    `<table class="side-diff"><colgroup><col class="diff-ln-col" /><col /><col class="diff-ln-col" /><col /></colgroup><thead><tr><th colspan="2">${esc(leftLabel)}</th><th colspan="2">${esc(rightLabel)}</th></tr></thead><tbody>${rowHtml}</tbody></table>`;
+}
+
+async function openFileDiff(path) {
+  if (demo || !invoke) return toast("Preview mode — the file diff needs the macOS build.", true);
+  if (!state.diff?.recordKey) return;
+  const requestId = ++state.fileDiffRequest;
+  state.fileDiff = null;
+  $("file-diff-modal").classList.remove("hidden");
+  $("file-diff-title").textContent = path;
+  $("file-diff-meta").textContent = "Loading both versions…";
+  $("file-diff-note").textContent = "";
+  $("file-diff-note").classList.add("hidden");
+  $("file-diff-legend").classList.remove("hidden");
+  $("file-diff-body").innerHTML = '<div class="version-empty">Loading file contents…</div>';
+  try {
+    const result = await invoke("diff_backup_file", {
+      record: state.diff.recordKey,
+      previous: state.diff.previousRecordKey || null,
+      path,
+    });
+    if (requestId !== state.fileDiffRequest) return;
+    state.fileDiff = result;
+    renderFileDiff(result);
+  } catch (e) {
+    if (requestId !== state.fileDiffRequest) return;
+    $("file-diff-meta").textContent = "Could not load the file diff.";
+    $("file-diff-body").innerHTML = `<div class="version-empty">${esc(e)}</div>`;
+  }
 }
 
 async function refreshLogs() {
@@ -1445,9 +1802,14 @@ function bind() {
       openFilesDir(open.getAttribute("data-files-open"));
       return;
     }
+    const versions = event.target.closest("[data-files-versions]");
+    if (versions) {
+      openRestoreDialog(versions.getAttribute("data-files-versions"));
+      return;
+    }
     const restore = event.target.closest("[data-files-restore]");
     if (restore) {
-      restoreFilesEntry(restore.getAttribute("data-files-restore"));
+      openRestoreDialog(restore.getAttribute("data-files-restore"));
       return;
     }
     const ignore = event.target.closest("[data-files-ignore]");
@@ -1461,6 +1823,8 @@ function bind() {
   $("files-cancel").addEventListener("click", async () => {
     try { await invoke("cancel_backup"); } catch (e) { toast(String(e), true); }
   });
+  $("files-dest-pick").addEventListener("click", () => pickRestoreDestination("files-dest"));
+  $("restore-dest-pick").addEventListener("click", () => pickRestoreDestination("restore-dest"));
   $("files-restore-all").addEventListener("click", restoreEntireFiles);
   $("refresh-cost").addEventListener("click", () => refreshEstimate(true));
   $("diff-close").addEventListener("click", closeDiff);
@@ -1472,8 +1836,40 @@ function bind() {
     renderDiff();
   });
   $("diff-kind").addEventListener("change", renderDiff);
+  $("diff-table").addEventListener("click", (event) => {
+    const target = event.target.closest("[data-diff-file]");
+    if (target) openFileDiff(target.getAttribute("data-diff-file"));
+  });
+  $("file-diff-close").addEventListener("click", closeFileDiff);
+  $("file-diff-modal").addEventListener("click", (event) => {
+    if (event.target === $("file-diff-modal")) closeFileDiff();
+  });
+  $("restore-close").addEventListener("click", closeRestoreDialog);
+  $("restore-cancel").addEventListener("click", closeRestoreDialog);
+  $("restore-confirm").addEventListener("click", restoreSelectedVersion);
+  $("restore-modal").addEventListener("click", (event) => {
+    if (event.target === $("restore-modal")) closeRestoreDialog();
+  });
+  $("restore-versions").addEventListener("change", (event) => {
+    const input = event.target.closest('input[name="restore-version"]');
+    if (!input) return;
+    state.restoreSelectedKey = input.value;
+    document.querySelectorAll("#restore-versions .version-row").forEach((row) => {
+      row.classList.toggle("selected", !!row.querySelector("input")?.checked);
+    });
+    $("restore-confirm").disabled = !state.restoreSelectedKey;
+  });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !$("diff-modal").classList.contains("hidden")) closeDiff();
+    if (event.key !== "Escape") return;
+    if (!$("file-diff-modal").classList.contains("hidden")) {
+      closeFileDiff();
+      return;
+    }
+    if (!$("restore-modal").classList.contains("hidden")) {
+      closeRestoreDialog();
+      return;
+    }
+    if (!$("diff-modal").classList.contains("hidden")) closeDiff();
   });
   $("refresh-logs").addEventListener("click", refreshLogs);
   $("clear-logs").addEventListener("click", async () => {

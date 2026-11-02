@@ -98,6 +98,337 @@ impl DiffSummary {
     }
 }
 
+/// Maximum number of bytes read from each side of a text diff.
+pub const MAX_TEXT_DIFF_BYTES: u64 = 2 * 1024 * 1024;
+/// Maximum number of lines compared and returned for each side.
+pub const MAX_TEXT_DIFF_LINES: usize = 4_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileDiffRowKind {
+    Same,
+    Added,
+    Removed,
+    Changed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDiffRow {
+    pub left_number: Option<usize>,
+    pub right_number: Option<usize>,
+    pub left: Option<String>,
+    pub right: Option<String>,
+    pub kind: FileDiffRowKind,
+}
+
+/// A side-by-side text diff for one file between two records.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDiff {
+    pub path: String,
+    pub record_key: String,
+    pub previous_record_key: Option<String>,
+    pub record_timestamp: Option<DateTime<Utc>>,
+    pub previous_timestamp: Option<DateTime<Utc>>,
+    pub left_size: u64,
+    pub right_size: u64,
+    pub binary: bool,
+    pub truncated: bool,
+    /// Human-readable explanation when no text rows are available.
+    pub message: Option<String>,
+    pub rows: Vec<FileDiffRow>,
+}
+
+/// Compare one file's contents between a record and its previous record (or a
+/// specific older record). The rows are already aligned for a side-by-side
+/// view, including added/deleted files where one side is empty.
+pub fn diff_file_text(
+    config: &AppConfig,
+    store: &dyn BlobStore,
+    record_selector: &str,
+    previous_selector: Option<&str>,
+    path: &str,
+) -> Result<FileDiff> {
+    let root = config.key_root();
+    let folder_uuid = &config.backup_set_uuid;
+    let record_key = resolve_record_key(store, &root, folder_uuid, record_selector)?;
+    let previous_key = match previous_selector.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(selector)
+            if selector.eq_ignore_ascii_case("none") || selector.eq_ignore_ascii_case("first") =>
+        {
+            None
+        }
+        Some(selector) => Some(resolve_record_key(store, &root, folder_uuid, selector)?),
+        None => previous_record_key(store, &root, folder_uuid, &record_key)?,
+    };
+    let keys = restore::load_keys(config, store, &root)?;
+    diff_file_between(
+        store,
+        &root,
+        &record_key,
+        previous_key.as_deref(),
+        keys.as_ref(),
+        path,
+    )
+}
+
+/// Compare one file between two already-resolved record keys.
+pub fn diff_file_between(
+    store: &dyn BlobStore,
+    root: &str,
+    record_key: &str,
+    previous_key: Option<&str>,
+    keys: Option<&MasterKeys>,
+    path: &str,
+) -> Result<FileDiff> {
+    let normalized = restore::normalize_backup_path(path)?;
+    let newer = record::load_record(store, record_key, keys)?;
+    let older = previous_key
+        .map(|key| record::load_record(store, key, keys))
+        .transpose()?;
+    let newer_node = restore::find_node_opt(store, root, keys, &newer, &normalized)?;
+    let older_node = match &older {
+        Some(record) => restore::find_node_opt(store, root, keys, record, &normalized)?,
+        None => None,
+    };
+
+    let mut diff = FileDiff {
+        path: normalized.clone(),
+        record_key: record_key.to_string(),
+        previous_record_key: previous_key.map(str::to_string),
+        record_timestamp: record::record_timestamp(record_key),
+        previous_timestamp: previous_key.and_then(record::record_timestamp),
+        left_size: older_node.as_ref().map_or(0, |node| node.item_size),
+        right_size: newer_node.as_ref().map_or(0, |node| node.item_size),
+        binary: false,
+        truncated: false,
+        message: None,
+        rows: Vec::new(),
+    };
+
+    let mut left = TextSide::default();
+    let mut right = TextSide::default();
+
+    for node in [&older_node, &newer_node].into_iter().flatten() {
+        if let Some(message) = unsupported_message(node) {
+            diff.message = Some(message);
+            return Ok(diff);
+        }
+        if node.item_size > MAX_TEXT_DIFF_BYTES {
+            diff.message = Some(too_large_message());
+            return Ok(diff);
+        }
+    }
+
+    if older_node.is_none() && newer_node.is_none() {
+        diff.message = Some("This path does not exist in either version.".into());
+        return Ok(diff);
+    }
+
+    if let Some(node) = &older_node {
+        left = read_text_side(store, root, keys, node)?;
+    }
+    if let Some(node) = &newer_node {
+        right = read_text_side(store, root, keys, node)?;
+    }
+
+    diff.binary = left.binary || right.binary;
+    diff.truncated = left.truncated || right.truncated;
+    if diff.binary {
+        diff.message = Some("Binary file — binary files are not diffed.".into());
+        return Ok(diff);
+    }
+    if diff.truncated {
+        diff.message = Some(too_large_message());
+        return Ok(diff);
+    }
+
+    diff.rows = build_side_by_side(&left.lines, &right.lines);
+    Ok(diff)
+}
+
+fn too_large_message() -> String {
+    format!(
+        "This file is too large to diff (limit {} MB or {} lines).",
+        MAX_TEXT_DIFF_BYTES / (1024 * 1024),
+        MAX_TEXT_DIFF_LINES
+    )
+}
+
+#[derive(Default)]
+struct TextSide {
+    lines: Vec<String>,
+    binary: bool,
+    truncated: bool,
+}
+
+fn unsupported_message(node: &Node) -> Option<String> {
+    if node.is_tree || Node::mode_is_dir(node.mac_st_mode) {
+        Some("Directories do not have text content to compare.".into())
+    } else if Node::mode_is_symlink(node.mac_st_mode) {
+        Some("Symlink targets are not shown in the text diff.".into())
+    } else {
+        None
+    }
+}
+
+fn read_text_side(
+    store: &dyn BlobStore,
+    root: &str,
+    keys: Option<&MasterKeys>,
+    node: &Node,
+) -> Result<TextSide> {
+    let mut bytes = Vec::new();
+    for loc in &node.data_blob_locs {
+        let data = record::load_node_blob(store, root, loc, keys)?;
+        if bytes.len() as u64 + data.len() as u64 > MAX_TEXT_DIFF_BYTES {
+            return Ok(TextSide {
+                lines: Vec::new(),
+                binary: false,
+                truncated: true,
+            });
+        }
+        bytes.extend_from_slice(&data);
+    }
+
+    let binary = bytes.contains(&0);
+    if binary {
+        return Ok(TextSide {
+            lines: Vec::new(),
+            binary: true,
+            truncated: false,
+        });
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+        .collect();
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    if lines.len() > MAX_TEXT_DIFF_LINES {
+        return Ok(TextSide {
+            lines: Vec::new(),
+            binary: false,
+            truncated: true,
+        });
+    }
+    Ok(TextSide {
+        lines,
+        binary: false,
+        truncated: false,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineOp {
+    Same,
+    Left,
+    Right,
+}
+
+fn line_ops(a: &[String], b: &[String]) -> Vec<LineOp> {
+    // The line count is capped, so a compact LCS table is bounded and keeps the
+    // implementation dependency-free. u16 is enough for 4,000 lines.
+    let n = a.len();
+    let m = b.len();
+    let stride = m + 1;
+    let mut dp = vec![0u16; (n + 1) * stride];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i * stride + j] = if a[i] == b[j] {
+                dp[(i + 1) * stride + j + 1] + 1
+            } else {
+                dp[(i + 1) * stride + j].max(dp[i * stride + j + 1])
+            };
+        }
+    }
+
+    let mut ops = Vec::with_capacity(n + m);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            ops.push(LineOp::Same);
+            i += 1;
+            j += 1;
+        } else if dp[(i + 1) * stride + j] >= dp[i * stride + j + 1] {
+            ops.push(LineOp::Left);
+            i += 1;
+        } else {
+            ops.push(LineOp::Right);
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push(LineOp::Left);
+        i += 1;
+    }
+    while j < m {
+        ops.push(LineOp::Right);
+        j += 1;
+    }
+    ops
+}
+
+fn build_side_by_side(a: &[String], b: &[String]) -> Vec<FileDiffRow> {
+    let ops = line_ops(a, b);
+    let mut rows = Vec::new();
+    let (mut i, mut j, mut index) = (0usize, 0usize, 0usize);
+    while index < ops.len() {
+        if ops[index] == LineOp::Same {
+            rows.push(FileDiffRow {
+                left_number: Some(i + 1),
+                right_number: Some(j + 1),
+                left: Some(a[i].clone()),
+                right: Some(b[j].clone()),
+                kind: FileDiffRowKind::Same,
+            });
+            i += 1;
+            j += 1;
+            index += 1;
+            continue;
+        }
+
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        while index < ops.len() && ops[index] != LineOp::Same {
+            if ops[index] == LineOp::Left {
+                removed.push(i);
+                i += 1;
+            } else {
+                added.push(j);
+                j += 1;
+            }
+            index += 1;
+        }
+        for k in 0..removed.len().max(added.len()) {
+            let left = removed.get(k).copied();
+            let right = added.get(k).copied();
+            let (left_text, right_text, kind) = match (left, right) {
+                (Some(left), Some(right)) => (
+                    Some(a[left].clone()),
+                    Some(b[right].clone()),
+                    FileDiffRowKind::Changed,
+                ),
+                (Some(left), None) => (Some(a[left].clone()), None, FileDiffRowKind::Removed),
+                (None, Some(right)) => (None, Some(b[right].clone()), FileDiffRowKind::Added),
+                (None, None) => continue,
+            };
+            rows.push(FileDiffRow {
+                left_number: left.map(|line| line + 1),
+                right_number: right.map(|line| line + 1),
+                left: left_text,
+                right: right_text,
+                kind,
+            });
+        }
+    }
+    rows
+}
+
 #[derive(Default)]
 struct Counts {
     added: u64,
@@ -669,6 +1000,34 @@ mod tests {
         node
     }
 
+    fn file_node(store: &LocalStore, content: &str, mtime: i64) -> Node {
+        let bytes = content.as_bytes();
+        let compressed = compress_blob(bytes);
+        let id = sha256_hex(bytes);
+        let relative = format!("standardobjects/{id}");
+        store
+            .put(&record::root_key(ROOT, &relative), &compressed.bytes)
+            .unwrap();
+        let mut node = Node {
+            is_tree: false,
+            item_size: bytes.len() as u64,
+            mtime_sec: mtime,
+            mtime_nsec: 0,
+            mac_st_mode: libc::S_IFREG as u32 | 0o644,
+            ..Node::default()
+        };
+        node.data_blob_locs = vec![BlobLoc {
+            blob_identifier: id,
+            is_packed: false,
+            relative_path: relative,
+            offset: 0,
+            length: compressed.bytes.len() as u64,
+            stretch_encryption_key: false,
+            compression_type: compressed.compression_type,
+        }];
+        node
+    }
+
     fn put_tree(store: &LocalStore, tree: &Tree) -> BlobLoc {
         let bytes = codec::encode_tree(tree);
         let compressed = compress_blob(&bytes);
@@ -852,5 +1211,103 @@ mod tests {
         assert_eq!(diff.entries.len(), 2);
         assert_eq!(diff.total_changes(), 2);
         assert!(diff.truncated);
+    }
+
+    #[test]
+    fn side_by_side_text_diff_aligns_changed_lines() {
+        let store = temp_store();
+        let old = write_record(
+            &store,
+            100,
+            &dir(
+                &store,
+                vec![("a.txt", file_node(&store, "one\ntwo\nthree\n", 10))],
+            ),
+        );
+        let new = write_record(
+            &store,
+            200,
+            &dir(
+                &store,
+                vec![("a.txt", file_node(&store, "one\n2\nthree\nfour\n", 10))],
+            ),
+        );
+
+        let diff = diff_file_between(&store, ROOT, &new, Some(&old), None, "a.txt").unwrap();
+        assert!(!diff.binary);
+        assert!(!diff.truncated);
+        let changes: Vec<_> = diff
+            .rows
+            .iter()
+            .filter(|row| row.kind != FileDiffRowKind::Same)
+            .map(|row| (row.kind, row.left.as_deref(), row.right.as_deref()))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![
+                (FileDiffRowKind::Changed, Some("two"), Some("2")),
+                (FileDiffRowKind::Added, None, Some("four")),
+            ]
+        );
+        assert_eq!(diff.rows[0].left_number, Some(1));
+        assert_eq!(diff.rows[0].right_number, Some(1));
+    }
+
+    #[test]
+    fn text_diff_handles_added_and_deleted_files() {
+        let store = temp_store();
+        let old = write_record(
+            &store,
+            100,
+            &dir(&store, vec![("gone.txt", file_node(&store, "bye\n", 10))]),
+        );
+        let new = write_record(
+            &store,
+            200,
+            &dir(&store, vec![("new.txt", file_node(&store, "hello\n", 10))]),
+        );
+
+        let added = diff_file_between(&store, ROOT, &new, Some(&old), None, "new.txt").unwrap();
+        assert_eq!(added.rows.len(), 1);
+        assert_eq!(added.rows[0].kind, FileDiffRowKind::Added);
+        assert!(added.rows[0].left.is_none());
+
+        let deleted = diff_file_between(&store, ROOT, &new, Some(&old), None, "gone.txt").unwrap();
+        assert_eq!(deleted.rows.len(), 1);
+        assert_eq!(deleted.rows[0].kind, FileDiffRowKind::Removed);
+        assert!(deleted.rows[0].right.is_none());
+    }
+
+    #[test]
+    fn binary_files_are_not_diffed() {
+        let store = temp_store();
+        let old = write_record(
+            &store,
+            100,
+            &dir(&store, vec![("a.bin", file_node(&store, "abc\0def", 10))]),
+        );
+        let new = write_record(
+            &store,
+            200,
+            &dir(&store, vec![("a.bin", file_node(&store, "abc\0xyz", 10))]),
+        );
+
+        let diff = diff_file_between(&store, ROOT, &new, Some(&old), None, "a.bin").unwrap();
+        assert!(diff.binary);
+        assert!(diff.rows.is_empty());
+        assert!(diff.message.unwrap_or_default().contains("Binary"));
+    }
+
+    #[test]
+    fn large_files_are_not_diffed() {
+        let store = temp_store();
+        let mut large = file_node(&store, "small on disk", 10);
+        large.item_size = MAX_TEXT_DIFF_BYTES + 1;
+        let old = write_record(&store, 100, &dir(&store, vec![("big.txt", large.clone())]));
+        let new = write_record(&store, 200, &dir(&store, vec![("big.txt", large)]));
+
+        let diff = diff_file_between(&store, ROOT, &new, Some(&old), None, "big.txt").unwrap();
+        assert!(diff.rows.is_empty());
+        assert!(diff.message.unwrap_or_default().contains("too large"));
     }
 }

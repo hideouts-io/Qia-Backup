@@ -32,6 +32,7 @@ use qia_backup::core::secrets;
 use qia_backup::core::snapshot;
 use qia_backup::core::status::AppStatus;
 use qia_backup::core::store::new_store;
+use qia_backup::core::versions;
 
 pub type SharedState = Arc<AppInner>;
 
@@ -416,6 +417,40 @@ async fn list_backup_entries(
     .map_err(err)?
 }
 
+/// Version history for one path across all completed records. `at_record`
+/// marks the version that was present in the record the user was browsing.
+#[tauri::command]
+async fn backup_file_versions(
+    state: State<'_, SharedState>,
+    path: String,
+    at_record: Option<String>,
+) -> Result<versions::FileVersionHistory, String> {
+    let cfg = state.config.lock().clone();
+    config::validate(&cfg).map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = new_store(&cfg).map_err(err)?;
+        versions::file_versions(&cfg, store.as_ref(), &path, at_record.as_deref()).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Number of distinct versions for every child of a directory.
+#[tauri::command]
+async fn backup_version_counts(
+    state: State<'_, SharedState>,
+    path: String,
+) -> Result<versions::VersionCounts, String> {
+    let cfg = state.config.lock().clone();
+    config::validate(&cfg).map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = new_store(&cfg).map_err(err)?;
+        versions::version_counts(&cfg, store.as_ref(), &path).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
 /// List a directory from the live in-progress backup tree.
 #[tauri::command]
 async fn list_partial_entries(
@@ -735,6 +770,24 @@ async fn diff_backup(
     .map_err(err)?
 }
 
+/// Side-by-side text diff for one file between two records.
+#[tauri::command]
+async fn diff_backup_file(
+    state: State<'_, SharedState>,
+    record: String,
+    previous: Option<String>,
+    path: String,
+) -> Result<qia_backup::core::diff::FileDiff, String> {
+    let cfg = state.config.lock().clone();
+    config::validate(&cfg).map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = new_store(&cfg).map_err(err)?;
+        diff::diff_file_text(&cfg, store.as_ref(), &record, previous.as_deref(), &path).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
 #[tauri::command]
 async fn prune_backups(
     state: State<'_, SharedState>,
@@ -1027,6 +1080,31 @@ fn apply_restore_progress(status: &Arc<Mutex<AppStatus>>, event: &RestoreEvent) 
     }
 }
 
+/// Choose a folder for restores. This keeps the destination editable while
+/// avoiding a typed path in the common case.
+#[tauri::command]
+async fn pick_restore_destination(
+    app: AppHandle,
+    current: Option<String>,
+) -> Result<Option<String>, String> {
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title("Choose a restore destination");
+    if let Some(current) = current
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        dialog = dialog.set_directory(current);
+    }
+    let Some(picked) = dialog.blocking_pick_folder() else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(err)?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
 /// Open a native picker and return the selected path relative to the source.
 ///
 /// Included folders only accept directories. Excludes accept files or folders
@@ -1204,12 +1282,16 @@ pub fn run() {
             cancel_backup,
             list_backups,
             list_backup_entries,
+            backup_file_versions,
+            backup_version_counts,
             list_partial_entries,
             pick_backup_path,
+            pick_restore_destination,
             ignore_backup_entry,
             remove_backup_entry,
             storage_estimate,
             diff_backup,
+            diff_backup_file,
             prune_backups,
             delete_backup_set,
             restore_backup,

@@ -26,5 +26,6 @@ pub mod snapshot;
 pub mod status;
 pub mod store;
 pub mod upload;
+pub mod versions;
 
 pub use error::{BackupError, Result};

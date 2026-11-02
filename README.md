@@ -312,11 +312,16 @@ independent of the Mac, and keep a copy of the config if possible.
    based on the bytes currently stored under this backup set.
 5. **Backups** lists completed records and offers **Changes** (added, modified
    and deleted files vs. the previous record), restore, prune and delete-set.
-   A running backup is shown on the Dashboard and as an in-progress notice.
+   In **Changes**, a modified file can be opened in a side-by-side diff that
+   aligns removed and added lines. Binary files and files above the diff size
+   limit are intentionally not diffed. A running backup is shown on the
+   Dashboard and as an in-progress notice.
 6. **Files** is the single restore surface: browse the latest completed backup,
    a specific revision, or the live **Partial current backup** while a run is
-   active. Restore one file, one folder, or the whole backup to a chosen folder.
-   Partial restore is available after stopping/cancelling the active run.
+   active. The **Versions** column counts distinct content versions across
+   completed backups. Restore one file or folder by choosing the exact version
+   to bring back, or restore the whole backup to a chosen folder. Partial
+   restore is available after stopping/cancelling the active run.
 7. **Activity** shows the log and can open the log/config folders.
 
 Closing the window hides Qia Backup to the macOS menu bar instead of quitting,
