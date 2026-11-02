@@ -72,6 +72,7 @@ const state = {
   restoreRequest: 0,
   fileDiff: null,
   fileDiffRequest: 0,
+  contentRequest: 0,
   storageEstimate: null,
   estimateAt: 0,
   estimateError: "",
@@ -919,6 +920,19 @@ function renderFiles() {
     } else {
       versionsCell = '<td class="versions-cell muted">—</td>';
     }
+    const inspectBlocked = actionBusy || !!state.status?.editing;
+    const inspectTitle = inspectBlocked ? "Wait for the current file action to finish" : "";
+    const canInspect = !entry.isDir && !entry.isSymlink;
+    const showContent = canInspect
+      ? (inspectBlocked
+          ? `<button class="link-button" type="button" disabled title="${inspectTitle}">Show content</button>`
+          : `<button class="link-button" type="button" data-files-content="${esc(entry.path)}" title="Show the file content">Show content</button>`)
+      : "";
+    const showDiff = canInspect
+      ? (inspectBlocked
+          ? `<button class="link-button" type="button" disabled title="${inspectTitle}">Diff</button>`
+          : `<button class="link-button" type="button" data-files-diff="${esc(entry.path)}" title="${partial ? "Compare this partial file with the latest completed backup" : "Compare this file with the previous revision"}">Diff</button>`)
+      : "";
     const restore = restoreBlocked
       ? '<button class="link-button" type="button" disabled title="Stop the active backup or restore before restoring">Restore</button>'
       : `<button class="link-button" type="button" data-files-restore="${esc(entry.path)}" title="Choose which version to restore">Restore</button>`;
@@ -940,7 +954,7 @@ function renderFiles() {
       <td>${size}</td>
       <td>${modified}</td>
       ${versionsCell}
-      <td><div class="files-actions">${restore}${ignore}${remove}</div></td>
+      <td><div class="files-actions">${showContent}${showDiff}${restore}${ignore}${remove}</div></td>
     </tr>`;
   }).join("");
 }
@@ -1394,15 +1408,94 @@ function closeFileDiff() {
   state.fileDiff = null;
 }
 
+function closeFileContent() {
+  state.contentRequest += 1;
+  $("content-modal").classList.add("hidden");
+}
+
+function renderFileContent(content, context = {}) {
+  const partial = context.partial ?? (state.filesRecordKey === "partial");
+  const recordKey = context.recordKey ?? state.filesRecordKey;
+  const record = state.backups.find((entry) => entry.key === recordKey) || state.backups[0];
+  const where = partial
+    ? (state.status?.running ? "in-progress backup" : "partial backup")
+    : (record ? `revision ${fmtDate(record.timestamp)}` : "latest revision");
+  $("content-title").textContent = content.path;
+  $("content-meta").textContent = `${fmtBytes(content.size)} · ${where}`;
+  const note = $("content-note");
+  if (content.message) {
+    note.textContent = content.message;
+    note.classList.remove("hidden");
+  } else {
+    note.textContent = "";
+    note.classList.add("hidden");
+  }
+  if (content.text == null) {
+    const excluded = content.binary || content.tooLarge;
+    $("content-body").innerHTML = `<div class="diff-unavailable">
+      <div class="diff-unavailable-icon" aria-hidden="true">…</div>
+      <p>${esc(content.message || "This file has no text content to show.")}</p>
+      ${excluded ? '<span class="muted small">Binary and large files are intentionally excluded from previews.</span>' : ""}
+    </div>`;
+    return;
+  }
+  const lines = content.text.split("\n");
+  if (lines.length && lines[lines.length - 1] === "") lines.pop();
+  if (lines.length === 1 && lines[0] === "") lines.length = 0;
+  if (!lines.length) {
+    $("content-body").innerHTML = '<div class="version-empty">This file is empty.</div>';
+    return;
+  }
+  const rows = lines.map((line, index) =>
+    `<tr><td class="ln" aria-hidden="true">${index + 1}</td><td class="code">${line === "" ? "&nbsp;" : esc(line)}</td></tr>`
+  ).join("");
+  $("content-meta").textContent += ` · ${lines.length.toLocaleString()} line${lines.length === 1 ? "" : "s"}`;
+  $("content-body").innerHTML = `<table class="content-lines"><tbody>${rows}</tbody></table>`;
+}
+
+async function openFileContent(path) {
+  if (demo || !invoke) return toast("Preview mode — file content needs the macOS build.", true);
+  const partial = state.filesRecordKey === "partial";
+  const recordKey = state.filesRecordKey || null;
+  const requestId = ++state.contentRequest;
+  $("content-modal").classList.remove("hidden");
+  $("content-title").textContent = path;
+  $("content-meta").textContent = "Loading file content…";
+  $("content-note").textContent = "";
+  $("content-note").classList.add("hidden");
+  $("content-body").innerHTML = '<div class="version-empty">Loading content…</div>';
+  try {
+    const result = partial
+      ? await invoke("read_partial_file_content", { path })
+      : await invoke("read_backup_file_content", {
+          recordKey,
+          path,
+        });
+    if (requestId !== state.contentRequest) return;
+    renderFileContent(result, { partial, recordKey });
+  } catch (e) {
+    if (requestId !== state.contentRequest) return;
+    $("content-meta").textContent = "Could not load file content.";
+    $("content-body").innerHTML = `<div class="version-empty">${esc(e)}</div>`;
+  }
+}
+
 function renderFileDiff(diff) {
+  const partial = diff.recordKey === "partial";
+  const running = !!state.status?.running;
+  const partialLabel = running ? "in-progress" : "partial";
   const leftLabel = diff.previousTimestamp
-    ? `Older — ${fmtDate(diff.previousTimestamp)}`
-    : "Older version";
-  const rightLabel = `Newer — ${fmtDate(diff.recordTimestamp)}`;
+    ? `${partial ? "Completed" : "Older"} — ${fmtDate(diff.previousTimestamp)}`
+    : (partial ? "No completed baseline" : "Older version");
+  const rightLabel = partial ? `${running ? "In-progress" : "Partial"} — current` : `Newer — ${fmtDate(diff.recordTimestamp)}`;
   $("file-diff-title").textContent = diff.path;
-  $("file-diff-meta").textContent = diff.previousTimestamp
-    ? `Comparing ${fmtDate(diff.previousTimestamp)} with ${fmtDate(diff.recordTimestamp)}.`
-    : "No older version exists; the file is shown as added.";
+  $("file-diff-meta").textContent = partial
+    ? (diff.previousTimestamp
+        ? `Comparing the latest completed backup (${fmtDate(diff.previousTimestamp)}) with the ${partialLabel} backup.`
+        : `No completed backup exists; the ${partialLabel} file is shown as added.`)
+    : (diff.previousTimestamp
+        ? `Comparing ${fmtDate(diff.previousTimestamp)} with ${fmtDate(diff.recordTimestamp)}.`
+        : "No older version exists; the file is shown as added.");
   const note = $("file-diff-note");
   const rows = diff.rows || [];
   if (!rows.length) {
@@ -1420,6 +1513,11 @@ function renderFileDiff(diff) {
   $("file-diff-legend").classList.remove("hidden");
   if (diff.message) {
     note.textContent = diff.message;
+    note.classList.remove("hidden");
+  } else if (partial) {
+    note.textContent = running
+      ? "The in-progress side reflects files completed so far and may still change."
+      : "The partial side reflects files captured by the interrupted run.";
     note.classList.remove("hidden");
   } else {
     note.textContent = "";
@@ -1444,9 +1542,14 @@ function renderFileDiff(diff) {
     `<table class="side-diff"><colgroup><col class="diff-ln-col" /><col /><col class="diff-ln-col" /><col /></colgroup><thead><tr><th colspan="2">${esc(leftLabel)}</th><th colspan="2">${esc(rightLabel)}</th></tr></thead><tbody>${rowHtml}</tbody></table>`;
 }
 
-async function openFileDiff(path) {
+async function openFileDiff(path, options = {}) {
   if (demo || !invoke) return toast("Preview mode — the file diff needs the macOS build.", true);
-  if (!state.diff?.recordKey) return;
+  const partial = !!options.partial;
+  const record = options.record ?? state.diff?.recordKey;
+  const previous = Object.prototype.hasOwnProperty.call(options, "previous")
+    ? options.previous
+    : (state.diff?.previousRecordKey ?? null);
+  if (!partial && !record) return;
   const requestId = ++state.fileDiffRequest;
   state.fileDiff = null;
   $("file-diff-modal").classList.remove("hidden");
@@ -1457,11 +1560,9 @@ async function openFileDiff(path) {
   $("file-diff-legend").classList.remove("hidden");
   $("file-diff-body").innerHTML = '<div class="version-empty">Loading file contents…</div>';
   try {
-    const result = await invoke("diff_backup_file", {
-      record: state.diff.recordKey,
-      previous: state.diff.previousRecordKey || null,
-      path,
-    });
+    const result = partial
+      ? await invoke("diff_partial_file", { path })
+      : await invoke("diff_backup_file", { record, previous, path });
     if (requestId !== state.fileDiffRequest) return;
     state.fileDiff = result;
     renderFileDiff(result);
@@ -1802,6 +1903,21 @@ function bind() {
       openFilesDir(open.getAttribute("data-files-open"));
       return;
     }
+    const content = event.target.closest("[data-files-content]");
+    if (content) {
+      openFileContent(content.getAttribute("data-files-content"));
+      return;
+    }
+    const fileDiff = event.target.closest("[data-files-diff]");
+    if (fileDiff) {
+      const path = fileDiff.getAttribute("data-files-diff");
+      if (state.filesRecordKey === "partial") {
+        openFileDiff(path, { partial: true });
+      } else {
+        openFileDiff(path, { record: state.filesRecordKey || "latest", previous: null });
+      }
+      return;
+    }
     const versions = event.target.closest("[data-files-versions]");
     if (versions) {
       openRestoreDialog(versions.getAttribute("data-files-versions"));
@@ -1838,11 +1954,15 @@ function bind() {
   $("diff-kind").addEventListener("change", renderDiff);
   $("diff-table").addEventListener("click", (event) => {
     const target = event.target.closest("[data-diff-file]");
-    if (target) openFileDiff(target.getAttribute("data-diff-file"));
+    if (target) openFileDiff(target.getAttribute("data-diff-file"), { record: state.diff.recordKey, previous: state.diff.previousRecordKey || null });
   });
   $("file-diff-close").addEventListener("click", closeFileDiff);
   $("file-diff-modal").addEventListener("click", (event) => {
     if (event.target === $("file-diff-modal")) closeFileDiff();
+  });
+  $("content-close").addEventListener("click", closeFileContent);
+  $("content-modal").addEventListener("click", (event) => {
+    if (event.target === $("content-modal")) closeFileContent();
   });
   $("restore-close").addEventListener("click", closeRestoreDialog);
   $("restore-cancel").addEventListener("click", closeRestoreDialog);
@@ -1861,6 +1981,10 @@ function bind() {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
+    if (!$("content-modal").classList.contains("hidden")) {
+      closeFileContent();
+      return;
+    }
     if (!$("file-diff-modal").classList.contains("hidden")) {
       closeFileDiff();
       return;
@@ -1971,7 +2095,22 @@ function demoBackups() {
   });
 }
 
+function setupModalScrollLock() {
+  const apply = () => {
+    const open = [...document.querySelectorAll(".modal-backdrop")].some(
+      (el) => !el.classList.contains("hidden")
+    );
+    document.body.classList.toggle("modal-open", open);
+  };
+  const observer = new window.MutationObserver(apply);
+  document.querySelectorAll(".modal-backdrop").forEach((el) => {
+    observer.observe(el, { attributes: true, attributeFilter: ["class"] });
+  });
+  apply();
+}
+
 async function init() {
+  setupModalScrollLock();
   bind();
   await setupEvents();
   await loadState();

@@ -319,9 +319,12 @@ independent of the Mac, and keep a copy of the config if possible.
 6. **Files** is the single restore surface: browse the latest completed backup,
    a specific revision, or the live **Partial current backup** while a run is
    active. The **Versions** column counts distinct content versions across
-   completed backups. Restore one file or folder by choosing the exact version
-   to bring back, or restore the whole backup to a chosen folder. Partial
-   restore is available after stopping/cancelling the active run.
+   completed backups. Use **Show content** to preview text files and **Diff**
+   to compare a completed file with its previous revision (or a partial file
+   with the latest completed backup). Binary and large files are intentionally
+   excluded from previews and diffs. Restore one file or folder by choosing the
+   exact version to bring back, or restore the whole backup to a chosen folder.
+   Partial restore is available after stopping/cancelling the active run.
 7. **Activity** shows the log and can open the log/config folders.
 
 Closing the window hides Qia Backup to the macOS menu bar instead of quitting,

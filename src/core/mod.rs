@@ -5,6 +5,7 @@ pub mod chunker;
 pub mod codec;
 pub mod compression;
 pub mod config;
+pub mod content;
 pub mod cost;
 pub mod crypto;
 pub mod diff;

@@ -370,7 +370,10 @@ impl BlobIndex {
 
     /// Write a full base index and then remove the journal segments it
     /// supersedes. Ordering matters: the base must be durable before a journal
-    /// is deleted. Leftover journals after a crash are harmless duplicates.
+    /// is deleted. If listing or deleting a journal fails, this returns an
+    /// error so callers (notably garbage collection) abort before deleting
+    /// objects that the leftover journal may still reference. Leftover
+    /// journals after a crash are harmless duplicates.
     pub fn save_and_clear(
         &mut self,
         store: &dyn BlobStore,
@@ -380,18 +383,16 @@ impl BlobIndex {
         self.updated_at = Utc::now();
         self.save(store, root, config)?;
         let prefix = Self::journal_prefix(root);
-        match store.list(&prefix) {
-            Ok(journals) => {
-                for object in journals {
-                    if let Err(e) = store.delete(&object.key) {
-                        logging::warn(format!(
-                            "could not delete old index journal {}: {e}",
-                            object.key
-                        ));
-                    }
-                }
-            }
-            Err(e) => logging::warn(format!("could not list index journals to clear: {e}")),
+        let journals = store.list(&prefix).map_err(|e| {
+            BackupError::Store(format!("could not list index journals to clear: {e}"))
+        })?;
+        for object in journals {
+            store.delete(&object.key).map_err(|e| {
+                BackupError::Store(format!(
+                    "could not delete old index journal {}: {e}",
+                    object.key
+                ))
+            })?;
         }
         self.journal_segments = 0;
         Ok(())
@@ -730,6 +731,85 @@ mod tests {
 
         let err = BlobIndex::load(&store, &root, &config).unwrap_err();
         assert!(matches!(err, BackupError::Store(_)), "got {err:?}");
+
+        std::fs::remove_file(BlobIndex::local_path(&config)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    struct DeleteFailingStore<'a> {
+        inner: &'a crate::core::store::LocalStore,
+    }
+
+    impl BlobStore for DeleteFailingStore<'_> {
+        fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.inner.put(key, data)
+        }
+
+        fn get(&self, key: &str) -> Result<Vec<u8>> {
+            self.inner.get(key)
+        }
+
+        fn get_opt(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get_opt(key)
+        }
+
+        fn head(&self, key: &str) -> Result<Option<crate::core::store::ObjectInfo>> {
+            self.inner.head(key)
+        }
+
+        fn delete(&self, _key: &str) -> Result<()> {
+            Err(BackupError::Store("delete blocked for test".into()))
+        }
+
+        fn list(&self, prefix: &str) -> Result<Vec<crate::core::store::ObjectInfo>> {
+            self.inner.list(prefix)
+        }
+
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+    }
+
+    #[test]
+    fn save_and_clear_reports_journal_cleanup_failure() {
+        let dir = std::env::temp_dir().join(format!("index-delete-fail-{}", uuid::Uuid::new_v4()));
+        let inner = crate::core::store::LocalStore::new(&dir).unwrap();
+        let config = AppConfig {
+            bucket: "bucket".into(),
+            prefix: "qia-backups".into(),
+            backup_set_uuid: uuid::Uuid::new_v4().to_string(),
+            ..AppConfig::default()
+        };
+        let root = config.key_root();
+        let mut index = BlobIndex::default();
+        index.add_blob(loc("a", false, "standardobjects/aa/a"));
+        index.save(&inner, &root, &config).unwrap();
+
+        let mut blobs = HashMap::new();
+        blobs.insert("b".into(), loc("b", true, "blobpacks/p1"));
+        let mut packs = HashMap::new();
+        packs.insert(
+            "blobpacks/p1".into(),
+            PackInfo {
+                path: "blobpacks/p1".into(),
+                size: 10,
+            },
+        );
+        BlobIndex::save_journal(&inner, &root, &blobs, &packs).unwrap();
+
+        let failing = DeleteFailingStore { inner: &inner };
+        let err = index.save_and_clear(&failing, &root, &config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not delete old index journal"),
+            "got {err:?}"
+        );
+        // The base was saved, but the journal remains. Callers must abort
+        // object deletion so the journal can never point at a deleted object.
+        assert_eq!(
+            inner.list(&BlobIndex::journal_prefix(&root)).unwrap().len(),
+            1
+        );
 
         std::fs::remove_file(BlobIndex::local_path(&config)).ok();
         std::fs::remove_dir_all(&dir).ok();

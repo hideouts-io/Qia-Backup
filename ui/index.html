@@ -494,6 +494,20 @@ Users/you/Projects"></textarea>
     </div>
   </div>
 
+  <div class="modal-backdrop hidden" id="content-modal" role="dialog" aria-modal="true" aria-labelledby="content-title">
+    <div class="modal content-modal card">
+      <div class="card-head">
+        <div>
+          <h3 id="content-title">File content</h3>
+          <p class="muted small" id="content-meta">Loading…</p>
+        </div>
+        <button class="link-button" id="content-close">Close</button>
+      </div>
+      <div class="file-diff-note muted small hidden" id="content-note"></div>
+      <div class="content-body" id="content-body">Loading…</div>
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
   <script src="app.js"></script>
 </body>

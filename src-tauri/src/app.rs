@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 use tauri_plugin_dialog::DialogExt;
 
 use qia_backup::core::config;
+use qia_backup::core::content;
 use qia_backup::core::cost;
 use qia_backup::core::diff;
 use qia_backup::core::edit;
@@ -451,6 +452,40 @@ async fn backup_version_counts(
     .map_err(err)?
 }
 
+/// Read one file's text content from a completed record.
+#[tauri::command]
+async fn read_backup_file_content(
+    state: State<'_, SharedState>,
+    record_key: Option<String>,
+    path: String,
+) -> Result<content::FileContent, String> {
+    let cfg = state.config.lock().clone();
+    config::validate(&cfg).map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = new_store(&cfg).map_err(err)?;
+        restore::read_file_content(&cfg, store.as_ref(), record_key.as_deref(), &path).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Read one file's text content from the live partial backup.
+#[tauri::command]
+async fn read_partial_file_content(
+    state: State<'_, SharedState>,
+    path: String,
+) -> Result<content::FileContent, String> {
+    let cfg = state.config.lock().clone();
+    config::validate(&cfg).map_err(err)?;
+    let partial = state.partial_tree.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = new_store(&cfg).map_err(err)?;
+        restore::read_partial_file_content(&cfg, store.as_ref(), &partial, &path).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
 /// List a directory from the live in-progress backup tree.
 #[tauri::command]
 async fn list_partial_entries(
@@ -783,6 +818,24 @@ async fn diff_backup_file(
     tauri::async_runtime::spawn_blocking(move || {
         let store = new_store(&cfg).map_err(err)?;
         diff::diff_file_text(&cfg, store.as_ref(), &record, previous.as_deref(), &path).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Side-by-side text diff of a partial file against the latest completed
+/// record. When no completed record exists, every line is shown as added.
+#[tauri::command]
+async fn diff_partial_file(
+    state: State<'_, SharedState>,
+    path: String,
+) -> Result<qia_backup::core::diff::FileDiff, String> {
+    let cfg = state.config.lock().clone();
+    config::validate(&cfg).map_err(err)?;
+    let partial = state.partial_tree.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = new_store(&cfg).map_err(err)?;
+        diff::diff_partial_file(&cfg, store.as_ref(), &partial, &path).map_err(err)
     })
     .await
     .map_err(err)?
@@ -1285,6 +1338,8 @@ pub fn run() {
             backup_file_versions,
             backup_version_counts,
             list_partial_entries,
+            read_backup_file_content,
+            read_partial_file_content,
             pick_backup_path,
             pick_restore_destination,
             ignore_backup_entry,
@@ -1292,6 +1347,7 @@ pub fn run() {
             storage_estimate,
             diff_backup,
             diff_backup_file,
+            diff_partial_file,
             prune_backups,
             delete_backup_set,
             restore_backup,
