@@ -3,8 +3,10 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::core::crypto::{hmac_sha256, sha256_hex};
@@ -231,6 +233,12 @@ impl S3Config {
 pub struct S3Store {
     config: S3Config,
     client: reqwest::blocking::Client,
+    /// Offset in seconds applied to the local clock when signing requests.
+    /// S3 rejects signatures whose `x-amz-date` is more than 15 minutes away
+    /// from its own clock (`RequestTimeTooSkewed`). If that happens we adopt
+    /// the server's clock from the error response and retry, so a Mac whose
+    /// clock has drifted can still back up without manual intervention.
+    clock_offset_secs: AtomicI64,
 }
 
 #[derive(Debug, Clone)]
@@ -255,11 +263,39 @@ impl S3Store {
             .user_agent(format!("backup/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| BackupError::S3(format!("HTTP client: {e}")))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            clock_offset_secs: AtomicI64::new(0),
+        })
     }
 
     pub fn config(&self) -> &S3Config {
         &self.config
+    }
+
+    /// The clock used for SigV4 signing: local time plus any correction
+    /// learned from an S3 `RequestTimeTooSkewed` response.
+    fn signing_now(&self) -> DateTime<Utc> {
+        let offset = self.clock_offset_secs.load(Ordering::Relaxed);
+        Utc::now() + chrono::Duration::seconds(offset)
+    }
+
+    /// Adopt `server_time` as the reference clock for signing. Returns true if
+    /// the offset actually changed, so the caller can retry the request.
+    fn adopt_server_clock(&self, server_time: DateTime<Utc>) -> bool {
+        let offset = server_time.signed_duration_since(Utc::now());
+        // Ignore implausible values (for example a broken proxy or a cached
+        // response) rather than moving the signing clock far into the past or
+        // future. One day is far beyond both the AWS tolerance and any useful
+        // correction for a drifting system clock.
+        if offset.num_seconds().abs() > 86_400 {
+            return false;
+        }
+        let previous = self
+            .clock_offset_secs
+            .swap(offset.num_seconds(), Ordering::Relaxed);
+        previous != offset.num_seconds()
     }
 
     fn target(&self, key: &str, query: &[(String, String)]) -> Result<RequestTarget> {
@@ -298,7 +334,7 @@ impl S3Store {
             target,
             payload_hash,
             extra_headers,
-            chrono::Utc::now(),
+            self.signing_now(),
         )
     }
 
@@ -373,8 +409,8 @@ impl S3Store {
         let target = self.target(key, query)?;
         let body_bytes = body.unwrap_or(&[]);
         let payload_hash = sha256_hex(body_bytes);
-        let headers = self.sign(method, &target, &payload_hash, extra_headers)?;
 
+        let method_name = method;
         let method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| BackupError::S3(format!("invalid method: {e}")))?;
 
@@ -384,6 +420,10 @@ impl S3Store {
         // scheduler retries the backup later.
         const MAX_ATTEMPTS: usize = 6;
         for attempt in 0..MAX_ATTEMPTS {
+            // Sign every attempt: retries must use a fresh `x-amz-date`, and a
+            // clock correction learned from a previous response has to be
+            // applied to the next signature.
+            let headers = self.sign(method_name, &target, &payload_hash, extra_headers)?;
             let mut req = self.client.request(method.clone(), &target.url);
             for (k, v) in &headers {
                 req = req.header(k, v);
@@ -394,6 +434,12 @@ impl S3Store {
             match req.send() {
                 Ok(response) => {
                     let status = response.status().as_u16();
+                    let response_date = response
+                        .headers()
+                        .get(reqwest::header::DATE)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| DateTime::parse_from_rfc2822(value).ok())
+                        .map(|value| value.with_timezone(&Utc));
                     let bytes = match response.bytes() {
                         Ok(bytes) => bytes.to_vec(),
                         Err(e) => {
@@ -408,6 +454,23 @@ impl S3Store {
                             return Err(BackupError::S3(last_error));
                         }
                     };
+                    // S3 rejects signatures that are more than 15 minutes
+                    // away from its clock. Adopt the server's time from the
+                    // error and retry immediately with a corrected signature
+                    // instead of failing the whole backup.
+                    if status == 403
+                        && let Some(server_time) = clock_skew_server_time(&bytes, response_date)
+                        && self.adopt_server_clock(server_time)
+                    {
+                        last_error = format!(
+                            "HTTP {status}: S3 clock differs from the local clock; \
+                             retrying with the server time"
+                        );
+                        if attempt + 1 < MAX_ATTEMPTS {
+                            continue;
+                        }
+                        return Err(BackupError::S3(last_error));
+                    }
                     if matches!(status, 408 | 425 | 429) || (500..600).contains(&status) {
                         last_error = format!(
                             "HTTP {status}: {}",
@@ -686,6 +749,26 @@ struct ListPage {
     is_truncated: bool,
 }
 
+/// If `body` is S3's `RequestTimeTooSkewed` error, return the server time it
+/// reported (falling back to the response `Date` header). Returns `None` for
+/// any other error, so unrelated 403s never move the signing clock.
+fn clock_skew_server_time(
+    body: &[u8],
+    response_date: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let text = std::str::from_utf8(body).ok()?;
+    if !text.contains("RequestTimeTooSkewed") {
+        return None;
+    }
+    if let Some((_, rest)) = text.split_once("<ServerTime>")
+        && let Some((value, _)) = rest.split_once("</ServerTime>")
+        && let Ok(parsed) = DateTime::parse_from_rfc3339(value.trim())
+    {
+        return Some(parsed.with_timezone(&Utc));
+    }
+    response_date
+}
+
 fn canonical_query(query: &[(String, String)]) -> String {
     let mut pairs: Vec<(String, String)> = query
         .iter()
@@ -806,6 +889,59 @@ mod tests {
         assert_eq!(
             auth,
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=d717e625459e73ca59996a42c07b4ac75570844f087bec7536dcd4bdde17b18f"
+        );
+    }
+
+    #[test]
+    fn reads_server_time_from_clock_skew_error() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>RequestTimeTooSkewed</Code><Message>clock</Message>
+<RequestTime>20261102T173223Z</RequestTime><ServerTime>2026-11-02T17:54:09Z</ServerTime>
+<MaxAllowedSkewMilliseconds>900000</MaxAllowedSkewMilliseconds></Error>"#;
+        let server = clock_skew_server_time(body, None).unwrap();
+        assert_eq!(server.to_rfc3339(), "2026-11-02T17:54:09+00:00");
+    }
+
+    #[test]
+    fn clock_skew_helper_ignores_unrelated_403_errors() {
+        let body = b"<Error><Code>AccessDenied</Code><ServerTime>2026-11-02T17:54:09Z</ServerTime></Error>";
+        assert!(clock_skew_server_time(body, None).is_none());
+    }
+
+    #[test]
+    fn adopted_server_clock_is_used_for_signing() {
+        let store = S3Store::new(S3Config {
+            bucket: "test-bucket".into(),
+            region: "us-east-1".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+        })
+        .unwrap();
+        let server = Utc::now() + chrono::Duration::seconds(1_800);
+        assert!(store.adopt_server_clock(server));
+        let corrected = store.signing_now();
+        let drift = corrected.signed_duration_since(Utc::now()).num_seconds();
+        assert!((drift - 1_800).abs() <= 5, "unexpected drift {drift}");
+    }
+
+    #[test]
+    fn implausible_server_clock_is_rejected() {
+        let store = S3Store::new(S3Config {
+            bucket: "test-bucket".into(),
+            region: "us-east-1".into(),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+        })
+        .unwrap();
+        let far_future = Utc::now() + chrono::Duration::days(2);
+        assert!(!store.adopt_server_clock(far_future));
+        assert_eq!(
+            store
+                .signing_now()
+                .signed_duration_since(Utc::now())
+                .num_seconds()
+                .abs(),
+            0
         );
     }
 
