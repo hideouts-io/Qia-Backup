@@ -21,7 +21,7 @@ use qia_backup::core::edit;
 use qia_backup::core::engine::{CancelToken, ProgressEvent, run_backup_with_partial};
 use qia_backup::core::error::BackupError;
 use qia_backup::core::logging;
-use qia_backup::core::model::AppConfig;
+use qia_backup::core::model::{AppConfig, StorageProvider};
 use qia_backup::core::partial::PartialTree;
 use qia_backup::core::preflight;
 use qia_backup::core::record;
@@ -37,10 +37,144 @@ use qia_backup::core::versions;
 pub type SharedState = Arc<AppInner>;
 
 pub struct AppInner {
-    pub config: Mutex<AppConfig>,
-    pub status: Arc<Mutex<AppStatus>>,
-    pub cancel: Mutex<CancelToken>,
-    pub partial_tree: PartialTree,
+    settings: Mutex<config::AppSettings>,
+    selected_provider: Mutex<StorageProvider>,
+    aws_s3: Arc<DestinationRuntime>,
+    backblaze_b2: Arc<DestinationRuntime>,
+    operation: Arc<Mutex<Option<StorageProvider>>>,
+}
+
+struct DestinationRuntime {
+    config: Mutex<AppConfig>,
+    status: Arc<Mutex<AppStatus>>,
+    cancel: Mutex<CancelToken>,
+    partial_tree: PartialTree,
+}
+
+/// The reservation follows the worker, including early errors and panics.
+struct OperationGuard {
+    slot: Arc<Mutex<Option<StorageProvider>>>,
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        *self.slot.lock() = None;
+    }
+}
+
+fn destination_runtime(inner: &SharedState, provider: StorageProvider) -> Arc<DestinationRuntime> {
+    match provider {
+        StorageProvider::AwsS3 => Arc::clone(&inner.aws_s3),
+        StorageProvider::BackblazeB2 => Arc::clone(&inner.backblaze_b2),
+    }
+}
+
+fn selected_runtime(inner: &SharedState) -> Arc<DestinationRuntime> {
+    destination_runtime(inner, *inner.selected_provider.lock())
+}
+
+fn require_idle(slot: &Option<StorageProvider>) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(
+            "finish or cancel the active destination operation before switching or saving settings"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn reserve_operation(
+    inner: &SharedState,
+    provider: StorageProvider,
+) -> Result<OperationGuard, String> {
+    let mut slot = inner.operation.lock();
+    require_idle(&slot)?;
+    *slot = Some(provider);
+    Ok(OperationGuard {
+        slot: Arc::clone(&inner.operation),
+    })
+}
+
+fn reserve_selected_operation(
+    inner: &SharedState,
+) -> Result<(Arc<DestinationRuntime>, OperationGuard), String> {
+    let mut slot = inner.operation.lock();
+    require_idle(&slot)?;
+    let provider = *inner.selected_provider.lock();
+    *slot = Some(provider);
+    Ok((
+        destination_runtime(inner, provider),
+        OperationGuard {
+            slot: Arc::clone(&inner.operation),
+        },
+    ))
+}
+
+fn persist_profile(inner: &SharedState, config: &AppConfig) -> Result<(), String> {
+    let mut settings = inner.settings.lock();
+    let next = settings.with_profile(config);
+    config::save_settings(&next).map_err(err)?;
+    *settings = next;
+    Ok(())
+}
+
+fn select_provider(inner: &SharedState, provider: StorageProvider) -> Result<(), String> {
+    let slot = inner.operation.lock();
+    require_idle(&slot)?;
+    let mut settings = inner.settings.lock();
+    if settings.profile(provider).is_some() {
+        let mut next = settings.clone();
+        next.selected_provider = provider;
+        config::save_settings(&next).map_err(err)?;
+        *settings = next;
+    }
+    *inner.selected_provider.lock() = provider;
+    Ok(())
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DestinationEvent<T> {
+    storage_provider: StorageProvider,
+    #[serde(flatten)]
+    payload: T,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DestinationMessage {
+    storage_provider: StorageProvider,
+    message: String,
+}
+
+fn emit_destination<T: Serialize + Clone>(
+    app: &AppHandle,
+    event: &str,
+    provider: StorageProvider,
+    payload: T,
+) {
+    let _ = app.emit(
+        event,
+        DestinationEvent {
+            storage_provider: provider,
+            payload,
+        },
+    );
+}
+
+fn emit_destination_message(
+    app: &AppHandle,
+    event: &str,
+    provider: StorageProvider,
+    message: String,
+) {
+    let _ = app.emit(
+        event,
+        DestinationMessage {
+            storage_provider: provider,
+            message,
+        },
+    );
 }
 
 struct TrayState {
@@ -125,7 +259,7 @@ fn tray_status(status: &AppStatus) -> (Option<String>, String, String) {
     }
 }
 
-fn spawn_tray_updater(app: AppHandle, status: Arc<Mutex<AppStatus>>) {
+fn spawn_tray_updater(app: AppHandle, inner: SharedState) {
     std::thread::spawn(move || {
         let Some(state) = app.try_state::<TrayState>() else {
             return;
@@ -139,7 +273,8 @@ fn spawn_tray_updater(app: AppHandle, status: Arc<Mutex<AppStatus>>) {
         let mut last_progress = String::new();
         loop {
             let (title, tooltip, progress) = {
-                let status = status.lock().clone();
+                let runtime = selected_runtime(&inner);
+                let status = runtime.status.lock().clone();
                 tray_status(&status)
             };
             if title != last_title {
@@ -162,6 +297,9 @@ fn spawn_tray_updater(app: AppHandle, status: Arc<Mutex<AppStatus>>) {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Bootstrap {
+    pub selected_provider: StorageProvider,
+    pub destinations: Vec<DestinationSummary>,
+    pub operation_active: bool,
     pub config: AppConfig,
     pub has_secret_access_key: bool,
     pub has_encryption_password: bool,
@@ -179,6 +317,39 @@ pub struct Bootstrap {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DestinationSummary {
+    pub storage_provider: StorageProvider,
+    pub configured: bool,
+    pub bucket: String,
+    pub backup_set_name: String,
+    pub scheduler_paused: bool,
+}
+
+fn destination_summaries(inner: &SharedState) -> Vec<DestinationSummary> {
+    let configured = {
+        let settings = inner.settings.lock();
+        [settings.aws_s3.is_some(), settings.backblaze_b2.is_some()]
+    };
+    [StorageProvider::AwsS3, StorageProvider::BackblazeB2]
+        .into_iter()
+        .zip(configured)
+        .map(|(provider, configured)| {
+            let runtime = destination_runtime(inner, provider);
+            let config = runtime.config.lock();
+            let status = runtime.status.lock();
+            DestinationSummary {
+                storage_provider: provider,
+                configured,
+                bucket: config.bucket.clone(),
+                backup_set_name: config.backup_set_name.clone(),
+                scheduler_paused: status.scheduler_paused,
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PickedBackupPath {
     pub absolute: String,
     pub relative: String,
@@ -188,6 +359,9 @@ pub struct PickedBackupPath {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusResponse {
+    pub selected_provider: StorageProvider,
+    pub destinations: Vec<DestinationSummary>,
+    pub operation_active: bool,
     pub status: AppStatus,
     pub logs: Vec<String>,
 }
@@ -212,8 +386,24 @@ fn snapshot_names(volume: &str) -> Vec<String> {
 
 #[tauri::command]
 fn get_state(state: State<'_, SharedState>) -> Bootstrap {
-    let config = state.config.lock().clone();
-    let status = state.status.lock().clone();
+    bootstrap(state.inner())
+}
+
+fn bootstrap(inner: &SharedState) -> Bootstrap {
+    let (config, status, selected_provider, operation_active, destinations) = {
+        let slot = inner.operation.lock();
+        let selected_provider = *inner.selected_provider.lock();
+        let runtime = destination_runtime(inner, selected_provider);
+        let config = runtime.config.lock().clone();
+        let status = runtime.status.lock().clone();
+        (
+            config,
+            status,
+            selected_provider,
+            slot.is_some(),
+            destination_summaries(inner),
+        )
+    };
     let volume = if config.snapshot_volume.is_empty() {
         config::default_snapshot_volume()
     } else {
@@ -222,6 +412,9 @@ fn get_state(state: State<'_, SharedState>) -> Bootstrap {
     let has_secret_access_key = !config.secret_access_key.is_empty();
     let has_encryption_password = !config.encryption_password.is_empty();
     Bootstrap {
+        selected_provider,
+        operation_active,
+        destinations,
         destination: config.destination(),
         source: config.source_description(),
         snapshots: snapshot_names(&volume),
@@ -245,22 +438,65 @@ fn get_state(state: State<'_, SharedState>) -> Bootstrap {
 
 #[tauri::command]
 fn get_status(state: State<'_, SharedState>) -> StatusResponse {
+    let slot = state.operation.lock();
+    let selected_provider = *state.selected_provider.lock();
+    let runtime = destination_runtime(state.inner(), selected_provider);
+    let status = runtime.status.lock().clone();
     StatusResponse {
-        status: state.status.lock().clone(),
+        selected_provider,
+        operation_active: slot.is_some(),
+        destinations: destination_summaries(state.inner()),
+        status,
         logs: logging::tail(200),
     }
 }
 
 #[tauri::command]
+fn select_destination(
+    state: State<'_, SharedState>,
+    provider: StorageProvider,
+) -> Result<Bootstrap, String> {
+    select_provider(state.inner(), provider)?;
+    Ok(bootstrap(state.inner()))
+}
+
+fn same_backup_destination(previous: &AppConfig, next: &AppConfig) -> bool {
+    previous.storage_provider == next.storage_provider
+        && previous.endpoint.trim().trim_end_matches('/')
+            == next.endpoint.trim().trim_end_matches('/')
+        && previous
+            .bucket
+            .trim()
+            .eq_ignore_ascii_case(next.bucket.trim())
+        && previous.region.trim() == next.region.trim()
+        && previous.key_root() == next.key_root()
+}
+
+#[tauri::command]
 fn save_config(state: State<'_, SharedState>, mut config: AppConfig) -> Result<AppConfig, String> {
-    let previous = state.config.lock().clone();
+    let slot = state.operation.lock();
+    require_idle(&slot)?;
+    if config.storage_provider != *state.selected_provider.lock() {
+        return Err("select the destination before saving its settings".into());
+    }
+    let runtime = selected_runtime(state.inner());
+    let previous = runtime.config.lock().clone();
+    let destination_changed = !same_backup_destination(&previous, &config);
+    if destination_changed {
+        config.last_backup_at = None;
+    }
     // Secrets are not sent to the webview. An empty field means "keep the
-    // value that is already in the Keychain". The encryption password belongs
-    // to a backup set and must not be carried across to a different set.
-    if config.secret_access_key.is_empty() {
+    // value that is already in the Keychain" for the same storage account.
+    // The encryption password belongs to a backup set and must not be carried
+    // across to a different set.
+    if config.secret_access_key.is_empty()
+        && config.storage_provider == previous.storage_provider
+        && config.endpoint == previous.endpoint
+        && config.access_key_id == previous.access_key_id
+    {
         config.secret_access_key = previous.secret_access_key.clone();
     }
-    if config.backup_set_uuid == previous.backup_set_uuid && config.encryption_password.is_empty() {
+    if same_backup_destination(&previous, &config) && config.encryption_password.is_empty() {
         config.encryption_password = previous.encryption_password.clone();
     }
     // The desktop app is APFS-snapshot-only.
@@ -269,16 +505,27 @@ fn save_config(state: State<'_, SharedState>, mut config: AppConfig) -> Result<A
     config::validate(&config).map_err(err)?;
     config::validate_source(&config).map_err(err)?;
     secrets::store_changed(&previous, &config).map_err(err)?;
-    config::save(&config).map_err(err)?;
-    *state.config.lock() = config.clone();
-    // A previous error may have been about the settings that just changed.
-    state.status.lock().last_error = None;
+    persist_profile(state.inner(), &config)?;
+    *runtime.config.lock() = config.clone();
+    if destination_changed {
+        runtime.partial_tree.clear();
+        let mut status = runtime.status.lock();
+        let paused = status.scheduler_paused;
+        *status = AppStatus {
+            scheduler_paused: paused,
+            ..AppStatus::default()
+        };
+    } else {
+        // A previous error may have been about the settings that just changed.
+        runtime.status.lock().last_error = None;
+    }
     logging::info("configuration saved");
     Ok(config)
 }
 
 #[tauri::command]
 async fn test_connection(state: State<'_, SharedState>) -> Result<String, String> {
+    let state = selected_runtime(state.inner());
     let cfg = state.config.lock().clone();
     tauri::async_runtime::spawn_blocking(move || {
         config::validate_connection(&cfg).map_err(err)?;
@@ -307,6 +554,7 @@ async fn test_connection(state: State<'_, SharedState>) -> Result<String, String
 async fn check_destination(
     state: State<'_, SharedState>,
 ) -> Result<preflight::DestinationCheck, String> {
+    let state = selected_runtime(state.inner());
     let cfg = state.config.lock().clone();
     tauri::async_runtime::spawn_blocking(move || {
         config::validate_connection(&cfg).map_err(err)?;
@@ -323,13 +571,16 @@ async fn check_destination(
 /// This only affects future backups; existing records are left untouched.
 #[tauri::command]
 fn ignore_backup_entry(state: State<'_, SharedState>, path: String) -> Result<Vec<String>, String> {
-    let mut guard = state.config.lock();
+    let slot = state.operation.lock();
+    require_idle(&slot)?;
+    let runtime = selected_runtime(state.inner());
+    let mut guard = runtime.config.lock();
     let mut config = guard.clone();
     let added = edit::add_ignore_path(&mut config, &path).map_err(err)?;
     if added.is_empty() {
         return Ok(added);
     }
-    config::save(&config).map_err(err)?;
+    persist_profile(state.inner(), &config)?;
     *guard = config;
     logging::info(format!("ignored backup path {path:?} in future backups"));
     Ok(added)
@@ -343,6 +594,7 @@ async fn remove_backup_entry(
     record_key: Option<String>,
     path: String,
 ) -> Result<edit::RemoveSummary, String> {
+    let (state, operation) = reserve_selected_operation(state.inner())?;
     {
         let mut status = state.status.lock();
         if status.running || status.restoring || status.editing {
@@ -360,6 +612,7 @@ async fn remove_backup_entry(
     }
     let status_arc = state.status.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = operation;
         let store = match new_store(&cfg) {
             Ok(store) => store,
             Err(e) => {
@@ -407,6 +660,7 @@ async fn list_backup_entries(
     record_key: Option<String>,
     path: String,
 ) -> Result<restore::BackupListing, String> {
+    let state = selected_runtime(state.inner());
     let cfg = state.config.lock().clone();
     config::validate(&cfg).map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -425,6 +679,7 @@ async fn backup_file_versions(
     path: String,
     at_record: Option<String>,
 ) -> Result<versions::FileVersionHistory, String> {
+    let state = selected_runtime(state.inner());
     let cfg = state.config.lock().clone();
     config::validate(&cfg).map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -441,6 +696,7 @@ async fn backup_version_counts(
     state: State<'_, SharedState>,
     path: String,
 ) -> Result<versions::VersionCounts, String> {
+    let state = selected_runtime(state.inner());
     let cfg = state.config.lock().clone();
     config::validate(&cfg).map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -457,6 +713,7 @@ async fn list_partial_entries(
     state: State<'_, SharedState>,
     path: String,
 ) -> Result<restore::BackupListing, String> {
+    let state = selected_runtime(state.inner());
     let cfg = state.config.lock().clone();
     config::validate(&cfg).map_err(err)?;
     let partial = state.partial_tree.clone();
@@ -480,10 +737,31 @@ async fn list_partial_entries(
 
 #[tauri::command]
 fn start_backup(state: State<'_, SharedState>, app: AppHandle) -> Result<(), String> {
-    start_backup_inner(state.inner().clone(), app, "manual")
+    let provider = *state.selected_provider.lock();
+    start_backup_inner(state.inner().clone(), provider, app, "manual")
 }
 
-fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Result<(), String> {
+#[tauri::command]
+fn start_destination_backup(
+    state: State<'_, SharedState>,
+    app: AppHandle,
+    provider: StorageProvider,
+) -> Result<Bootstrap, String> {
+    start_backup_inner(state.inner().clone(), provider, app, "manual")?;
+    Ok(bootstrap(state.inner()))
+}
+
+fn start_backup_inner(
+    shared: SharedState,
+    provider: StorageProvider,
+    app: AppHandle,
+    reason: &str,
+) -> Result<(), String> {
+    let operation = reserve_operation(&shared, provider)?;
+    let inner = destination_runtime(&shared, provider);
+    if shared.settings.lock().profile(provider).is_none() {
+        return Err("configure and save this destination before starting a backup".into());
+    }
     {
         let status = inner.status.lock();
         if status.running || status.restoring || status.editing {
@@ -494,6 +772,11 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
     config::validate_connection(&config).map_err(err)?;
     config::validate_source(&config).map_err(err)?;
     config::validate_backup_selection(&config).map_err(err)?;
+    persist_profile(&shared, &config)?;
+    {
+        let _slot = shared.operation.lock();
+        *shared.selected_provider.lock() = provider;
+    }
     let cancel = CancelToken::new();
     *inner.cancel.lock() = cancel.clone();
     let partial_tree = inner.partial_tree.clone();
@@ -508,6 +791,7 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
     logging::info(format!("starting backup ({reason})"));
     let scheduled = reason == "scheduled";
     std::thread::spawn(move || {
+        let _operation = operation;
         let mut cfg = config;
         let status_arc = inner.status.clone();
         let app_progress = app.clone();
@@ -539,7 +823,7 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
                                 | ProgressEvent::Finished { .. }
                         );
                         if important || last_emit.elapsed() >= Duration::from_millis(500) {
-                            let _ = app_progress.emit("backup-progress", &event);
+                            emit_destination(&app_progress, "backup-progress", provider, &event);
                             last_emit = Instant::now();
                         }
                     },
@@ -557,9 +841,12 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
                     status.partial_available = false;
                 }
                 {
-                    let mut shared = inner.config.lock();
-                    shared.last_backup_at = Some(summary.finished_at);
-                    if let Err(e) = config::save(&shared) {
+                    let updated = {
+                        let mut config = inner.config.lock();
+                        config.last_backup_at = Some(summary.finished_at);
+                        config.clone()
+                    };
+                    if let Err(e) = persist_profile(&shared, &updated) {
                         logging::warn(format!("could not save config after backup: {e}"));
                     }
                 }
@@ -569,7 +856,7 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
                     status.detail = "applying retention".into();
                 }
                 if !cfg.retain_all {
-                    let prune_cfg = inner.config.lock().clone();
+                    let prune_cfg = cfg.clone();
                     match new_store(&prune_cfg) {
                         Ok(store) => {
                             if let Err(e) = qia_backup::core::retention::prune(
@@ -595,7 +882,7 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
                     status.scheduler_failures = 0;
                     status.scheduler_retry_at = None;
                 }
-                let _ = app.emit("backup-finished", &summary);
+                emit_destination(&app, "backup-finished", provider, &summary);
             }
             Err(BackupError::Cancelled) => {
                 {
@@ -614,7 +901,12 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
                     }
                 }
                 logging::warn("backup cancelled");
-                let _ = app.emit("backup-cancelled", ());
+                emit_destination_message(
+                    &app,
+                    "backup-cancelled",
+                    provider,
+                    "backup cancelled".into(),
+                );
             }
             Err(e) => {
                 let message = e.to_string();
@@ -642,7 +934,7 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
                     }
                 }
                 logging::error(format!("backup failed: {message}"));
-                let _ = app.emit("backup-failed", message);
+                emit_destination_message(&app, "backup-failed", provider, message);
             }
         }
     });
@@ -684,6 +976,7 @@ fn apply_progress(status: &Arc<Mutex<AppStatus>>, event: &ProgressEvent) {
 
 #[tauri::command]
 fn set_scheduler_paused(state: State<'_, SharedState>, paused: bool) -> bool {
+    let state = selected_runtime(state.inner());
     state.status.lock().scheduler_paused = paused;
     logging::info(if paused {
         "automatic backups paused"
@@ -695,6 +988,7 @@ fn set_scheduler_paused(state: State<'_, SharedState>, paused: bool) -> bool {
 
 #[tauri::command]
 fn cancel_backup(state: State<'_, SharedState>) -> Result<(), String> {
+    let state = selected_runtime(state.inner());
     let mut status = state.status.lock();
     if !status.running && !status.restoring {
         return Err("nothing is running".into());
@@ -711,7 +1005,7 @@ fn cancel_backup(state: State<'_, SharedState>) -> Result<(), String> {
 async fn list_backups(
     state: State<'_, SharedState>,
 ) -> Result<Vec<config::BackupListEntry>, String> {
-    let inner = state.inner().clone();
+    let inner = selected_runtime(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
         let cfg = inner.config.lock().clone();
         config::validate(&cfg).map_err(err)?;
@@ -734,7 +1028,7 @@ async fn storage_estimate(
     state: State<'_, SharedState>,
     source_bytes: Option<u64>,
 ) -> Result<qia_backup::core::cost::StorageEstimate, String> {
-    let inner = state.inner().clone();
+    let inner = selected_runtime(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
         let cfg = inner.config.lock().clone();
         config::validate(&cfg).map_err(err)?;
@@ -752,7 +1046,7 @@ async fn diff_backup(
     previous: Option<String>,
     limit: Option<usize>,
 ) -> Result<qia_backup::core::diff::DiffSummary, String> {
-    let inner = state.inner().clone();
+    let inner = selected_runtime(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
         let cfg = inner.config.lock().clone();
         config::validate(&cfg).map_err(err)?;
@@ -778,6 +1072,7 @@ async fn diff_backup_file(
     previous: Option<String>,
     path: String,
 ) -> Result<qia_backup::core::diff::FileDiff, String> {
+    let state = selected_runtime(state.inner());
     let cfg = state.config.lock().clone();
     config::validate(&cfg).map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -793,8 +1088,10 @@ async fn prune_backups(
     state: State<'_, SharedState>,
     dry_run: bool,
 ) -> Result<qia_backup::core::retention::PruneSummary, String> {
-    let inner = state.inner().clone();
+    let (state, operation) = reserve_selected_operation(state.inner())?;
+    let inner = Arc::clone(&state);
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = operation;
         let cfg = inner.config.lock().clone();
         config::validate(&cfg).map_err(err)?;
         let store = new_store(&cfg).map_err(err)?;
@@ -807,8 +1104,10 @@ async fn prune_backups(
 
 #[tauri::command]
 async fn delete_backup_set(state: State<'_, SharedState>) -> Result<usize, String> {
-    let inner = state.inner().clone();
+    let (state, operation) = reserve_selected_operation(state.inner())?;
+    let inner = Arc::clone(&state);
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = operation;
         let cfg = inner.config.lock().clone();
         config::validate(&cfg).map_err(err)?;
         let store = new_store(&cfg).map_err(err)?;
@@ -825,6 +1124,8 @@ fn restore_backup(
     record_key: String,
     destination: String,
 ) -> Result<(), String> {
+    let (state, operation) = reserve_selected_operation(state.inner())?;
+    let provider = state.config.lock().storage_provider;
     {
         let status = state.status.lock();
         if status.running || status.restoring || status.editing {
@@ -840,8 +1141,9 @@ fn restore_backup(
         status.begin("restore", format!("record {record_key}"));
         status.restoring = true;
     }
-    let inner = state.inner().clone();
+    let inner = Arc::clone(&state);
     std::thread::spawn(move || {
+        let _operation = operation;
         let status_arc = inner.status.clone();
         let app_progress = app.clone();
         let destination = PathBuf::from(destination);
@@ -864,7 +1166,12 @@ fn restore_backup(
                             cancel.clone(),
                             &mut |event| {
                                 apply_restore_progress(&status_arc, &event);
-                                let _ = app_progress.emit("restore-progress", &event);
+                                emit_destination(
+                                    &app_progress,
+                                    "restore-progress",
+                                    provider,
+                                    &event,
+                                );
                             },
                         ),
                         Err(e) => Err(BackupError::Other(e)),
@@ -878,7 +1185,7 @@ fn restore_backup(
                         cancel.clone(),
                         &mut |event| {
                             apply_restore_progress(&status_arc, &event);
-                            let _ = app_progress.emit("restore-progress", &event);
+                            emit_destination(&app_progress, "restore-progress", provider, &event);
                         },
                     )
                 };
@@ -896,11 +1203,11 @@ fn restore_backup(
                     status.detail = String::new();
                     status.last_finished_at = Some(chrono::Utc::now());
                 }
-                let _ = app_progress.emit("restore-finished", &summary);
+                emit_destination(&app_progress, "restore-finished", provider, &summary);
             }
             Err(message) => {
                 inner.status.lock().fail(message.clone());
-                let _ = app_progress.emit("restore-failed", message);
+                emit_destination_message(&app_progress, "restore-failed", provider, message);
             }
         }
     });
@@ -917,6 +1224,8 @@ fn restore_backup_entry(
     path: String,
     destination: String,
 ) -> Result<(), String> {
+    let (state, operation) = reserve_selected_operation(state.inner())?;
+    let provider = state.config.lock().storage_provider;
     {
         let status = state.status.lock();
         if status.running || status.restoring || status.editing {
@@ -932,8 +1241,9 @@ fn restore_backup_entry(
         status.begin("restore", format!("entry {path}"));
         status.restoring = true;
     }
-    let inner = state.inner().clone();
+    let inner = Arc::clone(&state);
     std::thread::spawn(move || {
+        let _operation = operation;
         let status_arc = inner.status.clone();
         let app_progress = app.clone();
         let destination = PathBuf::from(destination);
@@ -947,7 +1257,7 @@ fn restore_backup_entry(
                 cancel.clone(),
                 &mut |event| {
                     apply_restore_progress(&status_arc, &event);
-                    let _ = app_progress.emit("restore-progress", &event);
+                    emit_destination(&app_progress, "restore-progress", provider, &event);
                 },
             )
             .map_err(|e| e.to_string()),
@@ -963,11 +1273,11 @@ fn restore_backup_entry(
                     status.detail = String::new();
                     status.last_finished_at = Some(chrono::Utc::now());
                 }
-                let _ = app_progress.emit("restore-finished", &summary);
+                emit_destination(&app_progress, "restore-finished", provider, &summary);
             }
             Err(message) => {
                 inner.status.lock().fail(message.clone());
-                let _ = app_progress.emit("restore-failed", message);
+                emit_destination_message(&app_progress, "restore-failed", provider, message);
             }
         }
     });
@@ -984,6 +1294,8 @@ fn restore_partial_entry(
     path: String,
     destination: String,
 ) -> Result<(), String> {
+    let (state, operation) = reserve_selected_operation(state.inner())?;
+    let provider = state.config.lock().storage_provider;
     {
         let status = state.status.lock();
         if status.running || status.restoring || status.editing {
@@ -1003,8 +1315,9 @@ fn restore_partial_entry(
         status.begin("restore", format!("partial {path}"));
         status.restoring = true;
     }
-    let inner = state.inner().clone();
+    let inner = Arc::clone(&state);
     std::thread::spawn(move || {
+        let _operation = operation;
         let status_arc = inner.status.clone();
         let app_progress = app.clone();
         let destination = PathBuf::from(destination);
@@ -1021,7 +1334,7 @@ fn restore_partial_entry(
                         cancel.clone(),
                         &mut |event| {
                             apply_restore_progress(&status_arc, &event);
-                            let _ = app_progress.emit("restore-progress", &event);
+                            emit_destination(&app_progress, "restore-progress", provider, &event);
                         },
                     )
                     .map_err(|e| e.to_string()),
@@ -1048,11 +1361,11 @@ fn restore_partial_entry(
                     status.detail = String::new();
                     status.last_finished_at = Some(chrono::Utc::now());
                 }
-                let _ = app_progress.emit("restore-finished", &summary);
+                emit_destination(&app_progress, "restore-finished", provider, &summary);
             }
             Err(message) => {
                 inner.status.lock().fail(message.clone());
-                let _ = app_progress.emit("restore-failed", message);
+                emit_destination_message(&app_progress, "restore-failed", provider, message);
             }
         }
     });
@@ -1116,6 +1429,7 @@ async fn pick_backup_path(
     kind: String,
     purpose: String,
 ) -> Result<Option<PickedBackupPath>, String> {
+    let state = selected_runtime(state.inner());
     if purpose != "include" && purpose != "exclude" {
         return Err("unknown picker purpose".into());
     }
@@ -1179,6 +1493,7 @@ async fn pick_backup_path(
 
 #[tauri::command]
 fn list_snapshots(state: State<'_, SharedState>) -> SnapshotResponse {
+    let state = selected_runtime(state.inner());
     let volume = {
         let cfg = state.config.lock();
         if cfg.snapshot_volume.is_empty() {
@@ -1245,27 +1560,50 @@ fn copy_to_clipboard(text: String) -> Result<(), String> {
     }
 }
 
-pub fn run() {
-    let config_exists = config::config_path().exists();
-    let mut config = config::load().unwrap_or_else(|e| {
-        logging::error(format!("could not load configuration: {e}"));
-        AppConfig::default()
-    });
-    // The desktop app is APFS-snapshot-only, including configs written by older
-    // versions or the CLI folder mode.
+fn other_provider(provider: StorageProvider) -> StorageProvider {
+    match provider {
+        StorageProvider::AwsS3 => StorageProvider::BackblazeB2,
+        StorageProvider::BackblazeB2 => StorageProvider::AwsS3,
+    }
+}
+
+fn provider_order(first: StorageProvider) -> [StorageProvider; 2] {
+    [first, other_provider(first)]
+}
+
+fn make_runtime(config: Option<AppConfig>, provider: StorageProvider) -> Arc<DestinationRuntime> {
+    let mut config = config.unwrap_or_else(|| config::new_profile(provider));
     config.source_kind = "snapshot".into();
     config.source_path.clear();
-    // Prefill a new or completely empty config with the recommended selection.
-    if !config_exists || (config.included_folders.is_empty() && config.exclude_patterns.is_empty())
-    {
+    if config.included_folders.is_empty() && config.exclude_patterns.is_empty() {
         config.included_folders = qia_backup::core::model::default_included_folders();
         config.exclude_patterns = qia_backup::core::model::default_exclude_patterns();
     }
-    let shared: SharedState = Arc::new(AppInner {
+    Arc::new(DestinationRuntime {
         config: Mutex::new(config),
         status: Arc::new(Mutex::new(AppStatus::paused())),
         cancel: Mutex::new(CancelToken::new()),
         partial_tree: PartialTree::new(),
+    })
+}
+
+pub fn run() {
+    let settings = config::load_settings().expect("could not load saved destination settings");
+    let selected_provider = settings.selected_provider;
+    let aws_s3 = make_runtime(
+        settings.profile(StorageProvider::AwsS3).cloned(),
+        StorageProvider::AwsS3,
+    );
+    let backblaze_b2 = make_runtime(
+        settings.profile(StorageProvider::BackblazeB2).cloned(),
+        StorageProvider::BackblazeB2,
+    );
+    let shared: SharedState = Arc::new(AppInner {
+        settings: Mutex::new(settings),
+        selected_provider: Mutex::new(selected_provider),
+        aws_s3,
+        backblaze_b2,
+        operation: Arc::new(Mutex::new(None)),
     });
     let scheduler_inner = shared.clone();
     tauri::Builder::default()
@@ -1274,6 +1612,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             get_status,
+            select_destination,
+            start_destination_backup,
             save_config,
             test_connection,
             check_destination,
@@ -1344,8 +1684,8 @@ pub fn run() {
                 progress: progress_item,
                 _menu: tray_menu,
             });
-            let status = app.state::<SharedState>().status.clone();
-            spawn_tray_updater(app.handle().clone(), status);
+            let inner = app.state::<SharedState>().inner().clone();
+            spawn_tray_updater(app.handle().clone(), inner);
 
             if let Some(window) = app.get_webview_window("main") {
                 let app_for_event = app.handle().clone();
@@ -1361,27 +1701,40 @@ pub fn run() {
 
             let handle = app.handle().clone();
             std::thread::spawn(move || {
+                let mut first_provider = StorageProvider::AwsS3;
                 loop {
                     std::thread::sleep(Duration::from_secs(30));
-                    let (paused, retry_at) = {
-                        let status = scheduler_inner.status.lock();
-                        (status.scheduler_paused, status.scheduler_retry_at)
-                    };
-                    if paused {
+                    if scheduler_inner.operation.lock().is_some() {
                         continue;
                     }
-                    if retry_at.is_some_and(|at| chrono::Utc::now() < at) {
-                        continue;
-                    }
-                    let due = {
-                        let cfg = scheduler_inner.config.lock();
-                        scheduler::is_due(cfg.last_backup_at, cfg.schedule_minutes)
-                    };
-                    if due {
-                        if let Err(e) =
-                            start_backup_inner(scheduler_inner.clone(), handle.clone(), "scheduled")
+                    for provider in provider_order(first_provider) {
+                        if scheduler_inner.settings.lock().profile(provider).is_none() {
+                            continue;
+                        }
+                        let runtime = destination_runtime(&scheduler_inner, provider);
+                        let status = runtime.status.lock().clone();
+                        if status.scheduler_paused
+                            || status
+                                .scheduler_retry_at
+                                .is_some_and(|at| chrono::Utc::now() < at)
                         {
-                            logging::debug(format!("scheduler did not start a backup: {e}"));
+                            continue;
+                        }
+                        let due = {
+                            let cfg = runtime.config.lock();
+                            scheduler::is_due(cfg.last_backup_at, cfg.schedule_minutes)
+                        };
+                        if due {
+                            first_provider = other_provider(provider);
+                            if let Err(e) = start_backup_inner(
+                                Arc::clone(&scheduler_inner),
+                                provider,
+                                handle.clone(),
+                                "scheduled",
+                            ) {
+                                logging::debug(format!("scheduler did not start a backup: {e}"));
+                            }
+                            break;
                         }
                     }
                 }
@@ -1406,4 +1759,146 @@ pub fn run() {
                 let _ = (app_handle, event);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_state() -> SharedState {
+        Arc::new(AppInner {
+            settings: Mutex::new(config::AppSettings::default()),
+            selected_provider: Mutex::new(StorageProvider::AwsS3),
+            aws_s3: make_runtime(None, StorageProvider::AwsS3),
+            backblaze_b2: make_runtime(None, StorageProvider::BackblazeB2),
+            operation: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    #[test]
+    fn destination_runtimes_keep_independent_drafts_status_and_partial_trees() {
+        let state = empty_state();
+        let aws = destination_runtime(&state, StorageProvider::AwsS3);
+        let b2 = destination_runtime(&state, StorageProvider::BackblazeB2);
+        assert_ne!(
+            aws.config.lock().backup_set_uuid,
+            b2.config.lock().backup_set_uuid
+        );
+        aws.config.lock().bucket = "aws-fixture".into();
+        aws.status.lock().last_error = Some("AWS fixture failure".into());
+        aws.partial_tree.begin();
+        aws.partial_tree.publish_dir(
+            "",
+            qia_backup::core::model::Node {
+                is_tree: true,
+                ..Default::default()
+            },
+            &[],
+            false,
+        );
+        assert!(b2.config.lock().bucket.is_empty());
+        assert!(b2.status.lock().last_error.is_none());
+        assert!(!b2.partial_tree.is_available());
+        assert!(aws.status.lock().scheduler_paused);
+        assert!(b2.status.lock().scheduler_paused);
+        select_provider(&state, StorageProvider::BackblazeB2).unwrap();
+        assert!(Arc::ptr_eq(&selected_runtime(&state), &b2));
+        assert!(aws.partial_tree.is_available());
+    }
+
+    #[test]
+    fn exclusive_operation_blocks_both_providers_and_settings_selection_until_drop() {
+        let state = empty_state();
+        let reservation = reserve_operation(&state, StorageProvider::AwsS3).unwrap();
+        assert!(reserve_operation(&state, StorageProvider::BackblazeB2).is_err());
+        assert!(select_provider(&state, StorageProvider::BackblazeB2).is_err());
+        drop(reservation);
+        select_provider(&state, StorageProvider::BackblazeB2).unwrap();
+        let (runtime, reservation) = reserve_selected_operation(&state).unwrap();
+        assert_eq!(
+            runtime.config.lock().storage_provider,
+            StorageProvider::BackblazeB2
+        );
+        assert_eq!(*state.operation.lock(), Some(StorageProvider::BackblazeB2));
+        drop(reservation);
+        assert!(state.operation.lock().is_none());
+    }
+
+    #[test]
+    fn concurrent_destination_mutations_have_exactly_one_reservation() {
+        let state = empty_state();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers = [StorageProvider::AwsS3, StorageProvider::BackblazeB2].map(|provider| {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let reservation = reserve_operation(&state, provider);
+                let reserved = reservation.is_ok();
+                // Keep the winning reservation until both attempts finish.
+                barrier.wait();
+                drop(reservation);
+                reserved
+            })
+        });
+        barrier.wait();
+        barrier.wait();
+        let winners = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(winners, 1);
+        assert!(state.operation.lock().is_none());
+    }
+
+    #[test]
+    fn encryption_password_retention_requires_the_same_backup_destination() {
+        let aws = config::new_profile(StorageProvider::AwsS3);
+        assert!(same_backup_destination(&aws, &aws));
+        let b2 = AppConfig {
+            storage_provider: StorageProvider::BackblazeB2,
+            ..aws.clone()
+        };
+        assert!(!same_backup_destination(&aws, &b2));
+        let bucket = AppConfig {
+            bucket: "different-bucket".into(),
+            ..aws.clone()
+        };
+        assert!(!same_backup_destination(&aws, &bucket));
+        let prefix = AppConfig {
+            prefix: "different-prefix".into(),
+            ..aws.clone()
+        };
+        assert!(!same_backup_destination(&aws, &prefix));
+        let uuid = AppConfig {
+            backup_set_uuid: "different-backup-set".into(),
+            ..aws.clone()
+        };
+        assert!(!same_backup_destination(&aws, &uuid));
+        let rotation = AppConfig {
+            access_key_id: "rotated-key-id".into(),
+            ..aws.clone()
+        };
+        assert!(same_backup_destination(&aws, &rotation));
+    }
+
+    #[test]
+    fn events_keep_provider_identity_and_existing_progress_fields() {
+        let event = DestinationEvent {
+            storage_provider: StorageProvider::BackblazeB2,
+            payload: ProgressEvent::File {
+                files: 2,
+                bytes_scanned: 42,
+            },
+        };
+        let encoded = serde_json::to_value(event).unwrap();
+        assert_eq!(encoded["storageProvider"], "backblaze_b2");
+        assert_eq!(encoded["kind"], "file");
+        assert_eq!(encoded["files"], 2);
+        assert_eq!(encoded["bytes_scanned"], 42);
+        assert_eq!(
+            provider_order(StorageProvider::BackblazeB2),
+            [StorageProvider::BackblazeB2, StorageProvider::AwsS3]
+        );
+    }
 }
