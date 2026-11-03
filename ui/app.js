@@ -73,6 +73,9 @@ const state = {
   fileDiff: null,
   fileDiffRequest: 0,
   contentRequest: 0,
+  confirmResolve: null,
+  speedHistory: [],
+  lastSpeedSampleAt: 0,
   storageEstimate: null,
   estimateAt: 0,
   estimateError: "",
@@ -102,6 +105,10 @@ function fmtBytes(n) {
   let i = 0;
   while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
   return `${n >= 100 || i === 0 ? Math.round(n) : n.toFixed(1)} ${units[i]}`;
+}
+
+function fmtSpeed(n) {
+  return `${fmtBytes(n)}/s`;
 }
 
 function backupProgress(s) {
@@ -213,12 +220,55 @@ function renderBanner() {
   }
   if (s.running) { banner(""); return; }
   if (s.lastError) { banner(s.lastError, true); return; }
+  if (s.powerPaused) { banner(""); return; }
+  if (s.powerMessage) { banner(s.powerMessage); return; }
   if (state.destinationCheck && !state.destinationCheck.canBackup) {
     const paused = s.schedulerPaused ? " Automatic backups are paused." : "";
     banner(`${state.destinationCheck.message}${paused}`, true);
     return;
   }
   banner("");
+}
+
+function confirmAction({ title, message, detail = "", confirmLabel = "Confirm", danger = false }) {
+  if (state.confirmResolve) state.confirmResolve(false);
+  return new Promise((resolve) => {
+    state.confirmResolve = resolve;
+    $("confirm-title").textContent = title;
+    $("confirm-message").textContent = message;
+    $("confirm-detail").textContent = detail;
+    $("confirm-detail").classList.toggle("hidden", !detail);
+    const accept = $("confirm-accept");
+    accept.textContent = confirmLabel;
+    accept.classList.toggle("danger", !!danger);
+    accept.classList.toggle("primary", !danger);
+    $("confirm-modal").classList.remove("hidden");
+    window.setTimeout(() => accept.focus(), 0);
+  });
+}
+
+function closeConfirm(result) {
+  if (!state.confirmResolve) return;
+  const resolve = state.confirmResolve;
+  state.confirmResolve = null;
+  $("confirm-modal").classList.add("hidden");
+  resolve(result);
+}
+
+async function authorizeSensitive(action) {
+  if (demo || !invoke) return true;
+  try {
+    await invoke("authorize_sensitive_action", { action });
+    return true;
+  } catch (e) {
+    toast(String(e), true);
+    return false;
+  }
+}
+
+async function clearSensitiveAuthorization() {
+  if (demo || !invoke) return;
+  try { await invoke("clear_sensitive_authorization"); } catch (_) { /* ignore */ }
 }
 
 function showView(name) {
@@ -482,6 +532,54 @@ async function refreshEstimate(force = false) {
   }
 }
 
+function renderTransferSpark() {
+  const el = $("transfer-spark");
+  if (!el) return;
+  const history = state.speedHistory;
+  if (!history.length) { el.innerHTML = ""; return; }
+  const max = Math.max(1, ...history.map((sample) => sample.bps));
+  el.innerHTML = history.map((sample) => {
+    const height = Math.max(6, Math.round((sample.bps / max) * 100));
+    return `<span style="height:${height}%" title="${esc(fmtSpeed(sample.bps))}"></span>`;
+  }).join("");
+}
+
+function renderTransfer(s) {
+  const active = !!s.running && !s.restoring;
+  const speed = Number(s.uploadSpeedBps || 0);
+  const target = Number(s.uploadTargetThreads || 0);
+  const max = Number(s.uploadMaxThreads || 0);
+  const inFlight = Number(s.uploadInFlight || 0);
+  $("progress-speed").textContent = active
+    ? (speed > 0 ? fmtSpeed(speed) : (inFlight > 0 ? "measuring…" : "0 B/s"))
+    : "—";
+  $("progress-transfer").textContent = active
+    ? `${fmtBytes(s.bytesUploaded)} uploaded`
+    : "Waiting for uploads…";
+  $("progress-workers").textContent = active && target > 0
+    ? `${inFlight} active · ${target}/${max} workers`
+    : (active ? "Starting upload workers…" : "");
+  if (!active) return;
+  const now = Date.now();
+  if (now - state.lastSpeedSampleAt >= 3000) {
+    state.speedHistory.push({ at: now, bps: speed });
+    if (state.speedHistory.length > 30) state.speedHistory.shift();
+    state.lastSpeedSampleAt = now;
+    renderTransferSpark();
+  }
+}
+
+function updatePowerPause() {
+  const el = $("power-pause");
+  if (!el) return;
+  const paused = !!state.status?.powerPaused;
+  el.classList.toggle("hidden", !paused);
+  if (paused) {
+    $("power-pause-message").textContent = state.status?.powerMessage
+      || "Power conditions paused the backup. It will resume automatically after five minutes of stable power.";
+  }
+}
+
 function updateStatus() {
   const s = state.status || {};
   const running = !!s.running;
@@ -500,6 +598,9 @@ function updateStatus() {
   } else if (s.lastError) {
     pill.classList.add("error");
     text.textContent = "Needs attention";
+  } else if (s.powerPaused || s.powerMessage) {
+    pill.classList.add("paused");
+    text.textContent = "Paused";
   } else if (s.lastSummary) {
     pill.classList.add("success");
     text.textContent = "Ready";
@@ -508,10 +609,11 @@ function updateStatus() {
   }
   const missingIncludes =
     !(state.config?.includedFolders || []).some((path) => String(path).trim());
-  $("backup-now").disabled = busy || missingIncludes;
+  const powerBlocked = !busy && !!s.powerMessage;
+  $("backup-now").disabled = busy || missingIncludes || powerBlocked;
   $("backup-now").title = missingIncludes
     ? "Select at least one Included folder in Settings"
-    : "";
+    : (powerBlocked ? s.powerMessage : "");
   $("cancel-run").classList.toggle("hidden", !running);
   $("cancel-run").disabled = !!s.cancelRequested;
   const auto = $("toggle-auto");
@@ -563,6 +665,7 @@ function updateStatus() {
       $("progress-upload").textContent = `${fmtBytes(s.bytesUploaded)} uploaded`;
       $("progress-percent").textContent = fmtPercent(progress);
     }
+    renderTransfer(s);
     const bar = $("progress-bar");
     if (pct == null) {
       bar.classList.add("indeterminate");
@@ -574,6 +677,7 @@ function updateStatus() {
       bar.title = `${fmtFileProgress(s)} (estimated from the previous backup)`;
     }
   }
+  updatePowerPause();
   updateFilesNote();
   updateDashboard();
   updateBackupsRunning();
@@ -584,6 +688,9 @@ function updateStatus() {
     loadState({ quiet: true });
   } else if (!state.lastRunning && running) {
     // Make the empty history state explain the run that is in progress.
+    state.speedHistory = [];
+    state.lastSpeedSampleAt = 0;
+    renderTransferSpark();
     renderBackups();
   }
   state.lastRunning = running;
@@ -598,7 +705,13 @@ function updateBackupsRunning() {
     el.textContent = "";
     return;
   }
-  el.textContent = `Backup in progress — ${Number(s.files || 0).toLocaleString()} files scanned, ${fmtBytes(s.bytesUploaded)} uploaded. Browse live progress in Files under Partial current backup; the completed record appears here when the run finishes.`;
+  const speed = Number(s.uploadSpeedBps || 0);
+  const workers = Number(s.uploadTargetThreads || 0);
+  const transfer = speed > 0 ? ` at ${fmtSpeed(speed)}` : "";
+  const concurrency = workers > 0
+    ? ` · ${Number(s.uploadInFlight || 0)}/${workers} uploads active`
+    : "";
+  el.textContent = `Backup in progress — ${Number(s.files || 0).toLocaleString()} files scanned, ${fmtBytes(s.bytesUploaded)} uploaded${transfer}${concurrency}. Browse live progress in Files under Partial current backup; the completed record appears here when the run finishes.`;
   el.classList.remove("hidden");
   el.classList.remove("error");
 }
@@ -1067,9 +1180,12 @@ function openFilesDir(path) {
 async function ignoreFilesEntry(path) {
   if (demo || !invoke) return toast("Preview mode — file actions are not available.", true);
   if (!path) return;
-  const ok = window.confirm(
-    `Ignore "${path}" in future backups?\n\nExisting backups are not changed.`
-  );
+  const ok = await confirmAction({
+    title: "Ignore this path?",
+    message: `Ignore "${path}" in future backups?`,
+    detail: "Existing backups are not changed. You can remove the exclude pattern later in Settings.",
+    confirmLabel: "Ignore path",
+  });
   if (!ok) return;
   try {
     const added = await invoke("ignore_backup_entry", { path });
@@ -1099,12 +1215,19 @@ async function removeFilesEntry(path) {
   if (state.status?.running || state.status?.restoring || state.status?.editing || state.filesActionBusy) {
     return toast("Stop the active backup or restore before removing files.", true);
   }
-  const ok = window.confirm(
-    `Remove "${path}" from this backup revision?\n\n` +
-      "This cannot be undone. Other backup revisions keep their copy. " +
-      "Use Ignore to skip it in future backups."
-  );
-  if (!ok) return;
+  const authed = await authorizeSensitive("remove");
+  if (!authed) return;
+  const ok = await confirmAction({
+    title: "Remove from this revision?",
+    message: `Remove "${path}" from this backup revision?`,
+    detail: "This cannot be undone. Other backup revisions keep their copy. Use Ignore to skip it in future backups.",
+    confirmLabel: "Remove",
+    danger: true,
+  });
+  if (!ok) {
+    await clearSensitiveAuthorization();
+    return;
+  }
   state.filesActionBusy = true;
   renderFiles();
   try {
@@ -1269,6 +1392,19 @@ async function restoreSelectedVersion() {
   if (!destination) return toast("Choose a destination folder first.", true);
   const path = state.restorePath || "";
   const partial = state.restorePartial;
+  const version = (state.restoreVersions || []).find(
+    (item) => item.recordKey === state.restoreSelectedKey
+  );
+  const when = partial
+    ? "the partial backup"
+    : (version?.timestamp ? fmtDate(version.timestamp) : "the selected version");
+  const ok = await confirmAction({
+    title: "Restore this version?",
+    message: `Restore ${path || "the entire backup"} from ${when}?`,
+    detail: `Destination: ${destination}\nExisting files may be overwritten.`,
+    confirmLabel: "Restore",
+  });
+  if (!ok) return;
   $("files-dest").value = destination;
   closeRestoreDialog();
   $("files-progress").classList.remove("hidden");
@@ -1301,14 +1437,17 @@ async function restoreEntireFiles() {
   if (!partial && !state.backups.length) return toast("No completed backup is available yet.", true);
   const destination = restoreDestinationValue();
   if (!destination) return toast("Choose a destination folder first.", true);
-  if (!partial) {
-    const record = state.backups.find((entry) => entry.key === state.filesRecordKey) || state.backups[0];
-    const when = record ? fmtDate(record.timestamp) : "latest backup";
-    const ok = window.confirm(
-      `Restore every file from the ${when} backup into:\n${destination}\n\nExisting files may be overwritten.`
-    );
-    if (!ok) return;
-  }
+  const record = partial
+    ? null
+    : (state.backups.find((entry) => entry.key === state.filesRecordKey) || state.backups[0]);
+  const when = partial ? "the partial backup" : (record ? fmtDate(record.timestamp) : "latest backup");
+  const ok = await confirmAction({
+    title: "Restore entire backup?",
+    message: `Restore every file from ${when}?`,
+    detail: `Destination: ${destination}\nExisting files may be overwritten.`,
+    confirmLabel: "Restore everything",
+  });
+  if (!ok) return;
   $("files-progress").classList.remove("hidden");
   $("files-phase").textContent = partial ? "Restoring partial backup…" : "Starting whole backup restore…";
   $("files-stats").textContent = "";
@@ -1700,6 +1839,11 @@ async function setupEvents() {
         next.bytesScanned = Number(p.bytesScanned ?? p.bytes_scanned ?? 0);
       } else if (p.kind === "upload") {
         next.bytesUploaded = Number(next.bytesUploaded || 0) + Number(p.bytes || 0);
+      } else if (p.kind === "transfer") {
+        next.uploadSpeedBps = Number(p.speedBps || next.uploadSpeedBps || 0);
+        next.uploadTargetThreads = Number(p.targetThreads || 0);
+        next.uploadMaxThreads = Number(p.maxThreads || 0);
+        next.uploadInFlight = Number(p.inFlight || 0);
       }
       state.status = next;
       updateStatus();
@@ -1719,6 +1863,16 @@ async function setupEvents() {
     },
     "backup-cancelled": () => {
       toast("Backup cancelled");
+    },
+    "backup-paused": async (e) => {
+      toast(String(e.payload || "Backup paused for power conditions"));
+      if (!demo && invoke) {
+        try {
+          const res = await invoke("get_status");
+          state.status = res.status || state.status;
+          updateStatus();
+        } catch (_) { /* poll will retry */ }
+      }
     },
     "restore-progress": (e) => {
       const p = e.payload || {};
@@ -1824,7 +1978,31 @@ function bind() {
     $("encryption-password").placeholder = "Enter a password for the new backup set";
     toast("New backup set UUID generated — review encryption settings and save.");
   });
+  $("power-pause-cancel").addEventListener("click", async () => {
+    if (demo) return toast("Preview mode");
+    const ok = await confirmAction({
+      title: "Cancel the paused backup?",
+      message: "Do not resume this backup automatically?",
+      detail: "Already uploaded data stays available. Automatic backups will remain paused until you re-enable them.",
+      confirmLabel: "Don't resume",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await invoke("cancel_power_pause");
+      await poll();
+      toast("Paused backup cancelled");
+    } catch (e) { toast(String(e), true); }
+  });
   $("cancel-run").addEventListener("click", async () => {
+    const ok = await confirmAction({
+      title: "Cancel backup?",
+      message: "Cancel the running backup?",
+      detail: "Already uploaded data is kept. The next run resumes from the saved progress.",
+      confirmLabel: "Cancel backup",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await invoke("cancel_backup");
       state.status = {
@@ -1937,6 +2115,17 @@ function bind() {
     if (remove) removeFilesEntry(remove.getAttribute("data-files-remove"));
   });
   $("files-cancel").addEventListener("click", async () => {
+    const restoring = !!state.status?.restoring;
+    const ok = await confirmAction({
+      title: restoring ? "Cancel restore?" : "Cancel backup?",
+      message: restoring ? "Cancel the running restore?" : "Cancel the running backup?",
+      detail: restoring
+        ? "Files already written to the destination remain there."
+        : "Already uploaded data is kept. The next run resumes from the saved progress.",
+      confirmLabel: restoring ? "Cancel restore" : "Cancel backup",
+      danger: true,
+    });
+    if (!ok) return;
     try { await invoke("cancel_backup"); } catch (e) { toast(String(e), true); }
   });
   $("files-dest-pick").addEventListener("click", () => pickRestoreDestination("files-dest"));
@@ -1964,6 +2153,12 @@ function bind() {
   $("content-modal").addEventListener("click", (event) => {
     if (event.target === $("content-modal")) closeFileContent();
   });
+  $("confirm-close").addEventListener("click", () => closeConfirm(false));
+  $("confirm-cancel").addEventListener("click", () => closeConfirm(false));
+  $("confirm-accept").addEventListener("click", () => closeConfirm(true));
+  $("confirm-modal").addEventListener("click", (event) => {
+    if (event.target === $("confirm-modal")) closeConfirm(false);
+  });
   $("restore-close").addEventListener("click", closeRestoreDialog);
   $("restore-cancel").addEventListener("click", closeRestoreDialog);
   $("restore-confirm").addEventListener("click", restoreSelectedVersion);
@@ -1981,6 +2176,10 @@ function bind() {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
+    if (!$("confirm-modal").classList.contains("hidden")) {
+      closeConfirm(false);
+      return;
+    }
     if (!$("content-modal").classList.contains("hidden")) {
       closeFileContent();
       return;
@@ -1998,6 +2197,14 @@ function bind() {
   $("refresh-logs").addEventListener("click", refreshLogs);
   $("clear-logs").addEventListener("click", async () => {
     if (demo) return;
+    const ok = await confirmAction({
+      title: "Clear activity log?",
+      message: "Clear the on-disk activity log?",
+      detail: "This does not affect any backup data.",
+      confirmLabel: "Clear log",
+      danger: true,
+    });
+    if (!ok) return;
     try { await invoke("clear_logs"); await refreshLogs(); } catch (e) { toast(String(e), true); }
   });
   $("open-log").addEventListener("click", () => {
@@ -2016,7 +2223,19 @@ function bind() {
   });
   $("delete-set").addEventListener("click", async () => {
     if (demo) return toast("Preview mode");
-    if (!window.confirm("Delete all objects in this backup set? This cannot be undone.")) return;
+    const authed = await authorizeSensitive("delete_set");
+    if (!authed) return;
+    const ok = await confirmAction({
+      title: "Delete the entire backup set?",
+      message: "Delete every object in this backup set?",
+      detail: "This cannot be undone. All backup records and referenced data will be removed.",
+      confirmLabel: "Delete everything",
+      danger: true,
+    });
+    if (!ok) {
+      await clearSensitiveAuthorization();
+      return;
+    }
     try {
       const n = await invoke("delete_backup_set");
       toast(`Deleted ${n} objects`);
@@ -2096,11 +2315,28 @@ function demoBackups() {
 }
 
 function setupModalScrollLock() {
+  let locked = false;
+  let savedScrollY = 0;
   const apply = () => {
     const open = [...document.querySelectorAll(".modal-backdrop")].some(
       (el) => !el.classList.contains("hidden")
     );
-    document.body.classList.toggle("modal-open", open);
+    if (open === locked) return;
+    locked = open;
+    if (open) {
+      // The document element is the actual scrolling container in WebKit, so
+      // locking <body> alone still lets the page scroll behind a modal. A fixed
+      // body plus a negative top keeps the background visually in place.
+      savedScrollY = window.scrollY || document.documentElement.scrollTop || 0;
+      document.documentElement.classList.add("modal-open");
+      document.body.classList.add("modal-open");
+      document.body.style.top = `-${savedScrollY}px`;
+    } else {
+      document.documentElement.classList.remove("modal-open");
+      document.body.classList.remove("modal-open");
+      document.body.style.top = "";
+      window.scrollTo(0, savedScrollY);
+    }
   };
   const observer = new window.MutationObserver(apply);
   document.querySelectorAll(".modal-backdrop").forEach((el) => {

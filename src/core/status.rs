@@ -43,6 +43,24 @@ pub struct AppStatus {
     /// after it was interrupted before writing a record.
     #[serde(default)]
     pub partial_available: bool,
+    /// Rolling upload throughput measured over the last few seconds.
+    #[serde(default)]
+    pub upload_speed_bps: u64,
+    /// Current and maximum upload worker concurrency chosen by the pool.
+    #[serde(default)]
+    pub upload_target_threads: u32,
+    #[serde(default)]
+    pub upload_max_threads: u32,
+    /// Uploads currently handed to the worker pool and not yet completed.
+    #[serde(default)]
+    pub upload_in_flight: u32,
+    /// A backup was paused because the Mac slept or switched to battery. It
+    /// will resume automatically after stable power returns.
+    #[serde(default)]
+    pub power_paused: bool,
+    /// Explanation shown while backups are gated by power conditions.
+    #[serde(default)]
+    pub power_message: String,
 }
 
 impl AppStatus {
@@ -66,6 +84,11 @@ impl AppStatus {
         self.started_at = Some(Utc::now());
         self.last_error = None;
         self.cancel_requested = false;
+        self.upload_speed_bps = 0;
+        self.upload_target_threads = 0;
+        self.upload_max_threads = 0;
+        self.upload_in_flight = 0;
+        self.power_paused = false;
     }
 
     pub fn fail(&mut self, message: impl Into<String>) {
@@ -74,5 +97,96 @@ impl AppStatus {
         self.editing = false;
         self.last_error = Some(message.into());
         self.last_finished_at = Some(Utc::now());
+        self.upload_speed_bps = 0;
+        self.upload_in_flight = 0;
+    }
+}
+
+/// Rolling upload throughput over a fixed window. Upload completions are
+/// bursty (a 64 MiB pack can take many seconds), so a 15 second window gives a
+/// stable speed without hiding changes for too long.
+pub struct TransferMeter {
+    samples: std::collections::VecDeque<(std::time::Instant, u64)>,
+    speed_bps: u64,
+}
+
+impl TransferMeter {
+    pub const WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+
+    pub fn new() -> Self {
+        Self {
+            samples: std::collections::VecDeque::new(),
+            speed_bps: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.samples.clear();
+        self.speed_bps = 0;
+    }
+
+    pub fn record(&mut self, bytes: u64) {
+        self.record_at(bytes, std::time::Instant::now());
+    }
+
+    pub fn snapshot(&mut self) -> u64 {
+        self.snapshot_at(std::time::Instant::now())
+    }
+
+    fn record_at(&mut self, bytes: u64, now: std::time::Instant) {
+        self.samples.push_back((now, bytes));
+        self.recompute(now);
+    }
+
+    fn snapshot_at(&mut self, now: std::time::Instant) -> u64 {
+        self.recompute(now);
+        self.speed_bps
+    }
+
+    fn recompute(&mut self, now: std::time::Instant) {
+        while self
+            .samples
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > Self::WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        let bytes: u64 = self.samples.iter().map(|(_, bytes)| *bytes).sum();
+        self.speed_bps = (bytes as f64 / Self::WINDOW.as_secs_f64()) as u64;
+    }
+}
+
+impl Default for TransferMeter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn rolling_speed_uses_the_window_and_expires() {
+        let mut meter = TransferMeter::new();
+        let start = Instant::now();
+        meter.record_at(15 * 1024 * 1024, start);
+        assert_eq!(meter.snapshot_at(start), 1024 * 1024);
+        meter.record_at(15 * 1024 * 1024, start + Duration::from_secs(5));
+        assert_eq!(
+            meter.snapshot_at(start + Duration::from_secs(5)),
+            2 * 1024 * 1024
+        );
+        assert_eq!(meter.snapshot_at(start + Duration::from_secs(21)), 0);
+    }
+
+    #[test]
+    fn reset_clears_samples_and_speed() {
+        let mut meter = TransferMeter::new();
+        let start = Instant::now();
+        meter.record_at(10 * 1024 * 1024, start);
+        meter.reset();
+        assert_eq!(meter.snapshot_at(start), 0);
     }
 }

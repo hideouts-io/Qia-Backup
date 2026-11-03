@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -9,7 +10,7 @@ use serde::Serialize;
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
 use tauri::image::Image;
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 use tauri_plugin_dialog::DialogExt;
@@ -31,22 +32,51 @@ use qia_backup::core::retention;
 use qia_backup::core::scheduler;
 use qia_backup::core::secrets;
 use qia_backup::core::snapshot;
-use qia_backup::core::status::AppStatus;
+use qia_backup::core::status::{AppStatus, TransferMeter};
 use qia_backup::core::store::new_store;
 use qia_backup::core::versions;
 
 pub type SharedState = Arc<AppInner>;
 
+const AUTH_GRANT_TTL: Duration = Duration::from_secs(300);
+
 pub struct AppInner {
-    pub config: Mutex<AppConfig>,
-    pub status: Arc<Mutex<AppStatus>>,
-    pub cancel: Mutex<CancelToken>,
-    pub partial_tree: PartialTree,
+    config: Mutex<AppConfig>,
+    status: Arc<Mutex<AppStatus>>,
+    cancel: Mutex<CancelToken>,
+    partial_tree: PartialTree,
+    /// A short-lived, action-scoped grant produced by the macOS authentication
+    /// prompt. Destructive commands consume it exactly once.
+    sensitive_auth: Mutex<Option<SensitiveGrant>>,
+    /// Recent upload completions, used to display a rolling transfer speed.
+    transfer_meter: Arc<Mutex<TransferMeter>>,
+    /// Sleep/battery policy and the macOS observers that feed it.
+    power: crate::power::PowerMonitor,
+    /// Set before cancelling a run because power conditions changed. The
+    /// backup error handler turns this cancellation into a resumable pause.
+    power_pause_requested: AtomicBool,
+}
+
+struct SensitiveGrant {
+    action: String,
+    granted_at: Instant,
+}
+
+fn consume_sensitive_grant(inner: &AppInner, action: &str) -> Result<(), String> {
+    let mut guard = inner.sensitive_auth.lock();
+    match guard.take() {
+        Some(grant) if grant.action == action && grant.granted_at.elapsed() <= AUTH_GRANT_TTL => {
+            Ok(())
+        }
+        _ => Err("authentication is required for this action".into()),
+    }
 }
 
 struct TrayState {
     tray: TrayIcon<Wry>,
     progress: MenuItem<Wry>,
+    cancel: MenuItem<Wry>,
+    auto: MenuItem<Wry>,
     _menu: Menu<Wry>,
 }
 
@@ -109,10 +139,16 @@ fn tray_status(status: &AppStatus) -> (Option<String>, String, String) {
             Some(p) => format!("Backup {p}% · {} / {} files", status.files, total),
             None => format!("Backup · {} files · {}", status.files, status.phase),
         };
+        let speed = if status.upload_speed_bps > 0 {
+            format!(" · {}/s", human_bytes(status.upload_speed_bps))
+        } else {
+            String::new()
+        };
         let tooltip = format!(
-            "Qia Backup — {progress} · {} read · {} uploaded",
+            "Qia Backup — {progress} · {} read · {} uploaded{}",
             human_bytes(status.bytes_scanned),
-            human_bytes(status.bytes_uploaded)
+            human_bytes(status.bytes_uploaded),
+            speed
         );
         (Some(title), tooltip, progress)
     } else if let Some(error) = &status.last_error {
@@ -133,16 +169,33 @@ fn spawn_tray_updater(app: AppHandle, status: Arc<Mutex<AppStatus>>) {
         };
         let tray = state.tray.clone();
         let progress_item = state.progress.clone();
+        let cancel_item = state.cancel.clone();
+        let auto_item = state.auto.clone();
         drop(state);
 
         let mut last_title: Option<String> = None;
         let mut last_tooltip = String::new();
         let mut last_progress = String::new();
+        let mut last_cancel_label = String::new();
+        let mut last_cancel_enabled: Option<bool> = None;
+        let mut last_auto_label = String::new();
         loop {
-            let (title, tooltip, progress) = {
-                let status = status.lock().clone();
-                tray_status(&status)
+            let status = status.lock().clone();
+            let (title, tooltip, progress) = tray_status(&status);
+            let cancel_label = if status.cancel_requested {
+                "Cancelling…".to_string()
+            } else if status.restoring {
+                "Cancel restore".to_string()
+            } else {
+                "Cancel backup".to_string()
             };
+            let cancel_enabled = (status.running || status.restoring) && !status.cancel_requested;
+            let auto_label = if status.scheduler_paused {
+                "Resume automatic backups".to_string()
+            } else {
+                "Pause automatic backups".to_string()
+            };
+
             if title != last_title {
                 let _ = tray.set_title(title.as_deref());
                 last_title = title;
@@ -154,6 +207,18 @@ fn spawn_tray_updater(app: AppHandle, status: Arc<Mutex<AppStatus>>) {
             if progress != last_progress {
                 let _ = progress_item.set_text(progress.as_str());
                 last_progress = progress;
+            }
+            if cancel_label != last_cancel_label {
+                let _ = cancel_item.set_text(cancel_label.as_str());
+                last_cancel_label = cancel_label;
+            }
+            if Some(cancel_enabled) != last_cancel_enabled {
+                let _ = cancel_item.set_enabled(cancel_enabled);
+                last_cancel_enabled = Some(cancel_enabled);
+            }
+            if auto_label != last_auto_label {
+                let _ = auto_item.set_text(auto_label.as_str());
+                last_auto_label = auto_label;
             }
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -246,8 +311,15 @@ fn get_state(state: State<'_, SharedState>) -> Bootstrap {
 
 #[tauri::command]
 fn get_status(state: State<'_, SharedState>) -> StatusResponse {
+    let speed = state.transfer_meter.lock().snapshot();
+    let mut status = state.status.lock().clone();
+    status.upload_speed_bps = if status.running && !status.restoring {
+        speed
+    } else {
+        0
+    };
     StatusResponse {
-        status: state.status.lock().clone(),
+        status,
         logs: logging::tail(200),
     }
 }
@@ -344,6 +416,7 @@ async fn remove_backup_entry(
     record_key: Option<String>,
     path: String,
 ) -> Result<edit::RemoveSummary, String> {
+    consume_sensitive_grant(state.inner(), "remove")?;
     {
         let mut status = state.status.lock();
         if status.running || status.restoring || status.editing {
@@ -525,6 +598,12 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
             return Err("another backup or restore is already running".into());
         }
     }
+    if !inner.power.can_run() {
+        return Err(inner
+            .power
+            .message()
+            .unwrap_or_else(|| "backups are paused until power conditions recover".into()));
+    }
     let config = inner.config.lock().clone();
     config::validate_connection(&config).map_err(err)?;
     config::validate_source(&config).map_err(err)?;
@@ -539,12 +618,17 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
             format!("{reason} backup to {}", config.destination()),
         );
         status.partial_available = false;
+        status.power_paused = false;
+        status.power_message = inner.power.message().unwrap_or_default();
     }
+    inner.power_pause_requested.store(false, Ordering::SeqCst);
+    inner.transfer_meter.lock().reset();
     logging::info(format!("starting backup ({reason})"));
     let scheduled = reason == "scheduled";
     std::thread::spawn(move || {
         let mut cfg = config;
         let status_arc = inner.status.clone();
+        let transfer_meter = inner.transfer_meter.clone();
         let app_progress = app.clone();
         let mut last_emit = Instant::now();
         let result = match new_store(&cfg) {
@@ -559,7 +643,7 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
                         // event stream: a large backup emits one File event per
                         // file, and forwarding millions of them to the webview is
                         // far more expensive than polling twice a second.
-                        apply_progress(&status_arc, &event);
+                        apply_progress(&status_arc, &transfer_meter, &event);
                         if partial_tree.is_available() {
                             let mut status = status_arc.lock();
                             if !status.partial_available {
@@ -629,29 +713,64 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
                     status.cancel_requested = false;
                     status.scheduler_failures = 0;
                     status.scheduler_retry_at = None;
+                    status.upload_speed_bps = 0;
+                    status.upload_target_threads = 0;
+                    status.upload_max_threads = 0;
+                    status.upload_in_flight = 0;
+                    status.power_paused = false;
+                    status.power_message = inner.power.message().unwrap_or_default();
                 }
+                inner.power_pause_requested.store(false, Ordering::SeqCst);
                 let _ = app.emit("backup-finished", &summary);
             }
             Err(BackupError::Cancelled) => {
-                {
-                    let mut status = inner.status.lock();
-                    status.running = false;
-                    status.phase = "cancelled".into();
-                    status.detail = "backup cancelled".into();
-                    status.last_finished_at = Some(chrono::Utc::now());
-                    status.partial_available = partial_tree.is_available();
-                    status.scheduler_failures = 0;
-                    status.scheduler_retry_at = None;
-                    if scheduled {
-                        // Do not immediately retry a scheduled run the user
-                        // just cancelled.
-                        status.scheduler_paused = true;
+                let power_pause = inner.power_pause_requested.swap(false, Ordering::SeqCst);
+                if power_pause {
+                    let message = inner.power.message().unwrap_or_else(|| {
+                        "backup paused until power conditions recover".to_string()
+                    });
+                    {
+                        let mut status = inner.status.lock();
+                        status.running = false;
+                        status.phase = "paused".into();
+                        status.detail = message.clone();
+                        status.power_paused = true;
+                        status.power_message = message.clone();
+                        status.last_finished_at = Some(chrono::Utc::now());
+                        status.partial_available = partial_tree.is_available();
+                        status.scheduler_failures = 0;
+                        status.scheduler_retry_at = None;
+                        status.upload_speed_bps = 0;
+                        status.upload_target_threads = 0;
+                        status.upload_max_threads = 0;
+                        status.upload_in_flight = 0;
                     }
+                    logging::warn("backup paused for power conditions");
+                    let _ = app.emit("backup-paused", message);
+                } else {
+                    {
+                        let mut status = inner.status.lock();
+                        status.running = false;
+                        status.phase = "cancelled".into();
+                        status.detail = "backup cancelled".into();
+                        status.last_finished_at = Some(chrono::Utc::now());
+                        status.partial_available = partial_tree.is_available();
+                        status.scheduler_failures = 0;
+                        status.scheduler_retry_at = None;
+                        status.power_paused = false;
+                        status.power_message = inner.power.message().unwrap_or_default();
+                        if scheduled {
+                            // Do not immediately retry a scheduled run the user
+                            // just cancelled.
+                            status.scheduler_paused = true;
+                        }
+                    }
+                    logging::warn("backup cancelled");
+                    let _ = app.emit("backup-cancelled", ());
                 }
-                logging::warn("backup cancelled");
-                let _ = app.emit("backup-cancelled", ());
             }
             Err(e) => {
+                inner.power_pause_requested.store(false, Ordering::SeqCst);
                 let message = e.to_string();
                 let transient = scheduler::is_transient(&e);
                 {
@@ -684,7 +803,11 @@ fn start_backup_inner(inner: SharedState, app: AppHandle, reason: &str) -> Resul
     Ok(())
 }
 
-fn apply_progress(status: &Arc<Mutex<AppStatus>>, event: &ProgressEvent) {
+fn apply_progress(
+    status: &Arc<Mutex<AppStatus>>,
+    transfer_meter: &Arc<Mutex<TransferMeter>>,
+    event: &ProgressEvent,
+) {
     let mut status = status.lock();
     match event {
         ProgressEvent::Phase { name, detail } => {
@@ -705,6 +828,17 @@ fn apply_progress(status: &Arc<Mutex<AppStatus>>, event: &ProgressEvent) {
         }
         ProgressEvent::Upload { bytes, .. } => {
             status.bytes_uploaded += *bytes;
+            transfer_meter.lock().record(*bytes);
+        }
+        ProgressEvent::Transfer {
+            target_threads,
+            max_threads,
+            in_flight,
+            ..
+        } => {
+            status.upload_target_threads = *target_threads;
+            status.upload_max_threads = *max_threads;
+            status.upload_in_flight = *in_flight;
         }
         ProgressEvent::Totals { files, bytes } => {
             status.total_files = *files;
@@ -712,14 +846,73 @@ fn apply_progress(status: &Arc<Mutex<AppStatus>>, event: &ProgressEvent) {
         }
         ProgressEvent::Warning { .. } => {}
         ProgressEvent::Finished { summary } => {
+            status.upload_speed_bps = 0;
+            status.upload_in_flight = 0;
             status.last_summary = Some(summary.clone());
         }
     }
 }
 
+/// Prompt for Touch ID / Face ID / account password before a destructive
+/// action. The returned grant is scoped to one action and consumed by the
+/// matching command.
 #[tauri::command]
-fn set_scheduler_paused(state: State<'_, SharedState>, paused: bool) -> bool {
-    state.status.lock().scheduler_paused = paused;
+async fn authorize_sensitive_action(
+    state: State<'_, SharedState>,
+    action: String,
+) -> Result<(), String> {
+    let reason = match action.as_str() {
+        "remove" => "remove a file from a backup revision",
+        "delete_set" => "delete the entire backup set",
+        "prune" => "delete old backup revisions",
+        _ => return Err("unknown sensitive action".into()),
+    }
+    .to_string();
+    let inner = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || crate::auth::authenticate(&reason))
+        .await
+        .map_err(err)??;
+    *inner.sensitive_auth.lock() = Some(SensitiveGrant {
+        action,
+        granted_at: Instant::now(),
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_sensitive_authorization(state: State<'_, SharedState>) {
+    *state.sensitive_auth.lock() = None;
+}
+
+fn spawn_power_watcher(inner: SharedState) {
+    std::thread::spawn(move || {
+        loop {
+            let message = inner.power.message();
+            let can_run = inner.power.can_run();
+            let (running, restoring, cancel_requested) = {
+                let status = inner.status.lock();
+                (status.running, status.restoring, status.cancel_requested)
+            };
+            inner.status.lock().power_message = message.clone().unwrap_or_default();
+
+            if running && !restoring && !can_run && !cancel_requested {
+                {
+                    let mut status = inner.status.lock();
+                    status.phase = "pausing".into();
+                    status.detail = message
+                        .clone()
+                        .unwrap_or_else(|| "paused for power conditions".into());
+                }
+                inner.power_pause_requested.store(true, Ordering::SeqCst);
+                inner.cancel.lock().cancel();
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+}
+
+fn set_scheduler_paused_inner(inner: &AppInner, paused: bool) -> bool {
+    inner.status.lock().scheduler_paused = paused;
     logging::info(if paused {
         "automatic backups paused"
     } else {
@@ -729,8 +922,12 @@ fn set_scheduler_paused(state: State<'_, SharedState>, paused: bool) -> bool {
 }
 
 #[tauri::command]
-fn cancel_backup(state: State<'_, SharedState>) -> Result<(), String> {
-    let mut status = state.status.lock();
+fn set_scheduler_paused(state: State<'_, SharedState>, paused: bool) -> bool {
+    set_scheduler_paused_inner(state.inner().as_ref(), paused)
+}
+
+fn request_cancel(inner: &AppInner) -> Result<(), String> {
+    let mut status = inner.status.lock();
     if !status.running && !status.restoring {
         return Err("nothing is running".into());
     }
@@ -738,7 +935,29 @@ fn cancel_backup(state: State<'_, SharedState>) -> Result<(), String> {
     status.phase = "cancelling".into();
     status.detail = "cancellation requested — finishing the current operation".into();
     drop(status);
-    state.cancel.lock().cancel();
+    inner.cancel.lock().cancel();
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_backup(state: State<'_, SharedState>) -> Result<(), String> {
+    request_cancel(state.inner().as_ref())
+}
+
+#[tauri::command]
+fn cancel_power_pause(state: State<'_, SharedState>) -> Result<(), String> {
+    let mut status = state.status.lock();
+    if !status.power_paused {
+        return Err("no paused backup to cancel".into());
+    }
+    status.power_paused = false;
+    status.power_message = state.power.message().unwrap_or_default();
+    status.phase = "idle".into();
+    status.detail = String::new();
+    // The user explicitly chose not to resume. Keep automatic backups paused
+    // so the due interval cannot immediately start the same run again.
+    status.scheduler_paused = true;
+    logging::info("paused backup cancelled; automatic backups remain paused");
     Ok(())
 }
 
@@ -846,6 +1065,9 @@ async fn prune_backups(
     state: State<'_, SharedState>,
     dry_run: bool,
 ) -> Result<qia_backup::core::retention::PruneSummary, String> {
+    if !dry_run {
+        consume_sensitive_grant(state.inner(), "prune")?;
+    }
     let inner = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let cfg = inner.config.lock().clone();
@@ -860,6 +1082,7 @@ async fn prune_backups(
 
 #[tauri::command]
 async fn delete_backup_set(state: State<'_, SharedState>) -> Result<usize, String> {
+    consume_sensitive_grant(state.inner(), "delete_set")?;
     let inner = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let cfg = inner.config.lock().clone();
@@ -1319,6 +1542,10 @@ pub fn run() {
         status: Arc::new(Mutex::new(AppStatus::paused())),
         cancel: Mutex::new(CancelToken::new()),
         partial_tree: PartialTree::new(),
+        sensitive_auth: Mutex::new(None),
+        transfer_meter: Arc::new(Mutex::new(TransferMeter::new())),
+        power: crate::power::PowerMonitor::start(),
+        power_pause_requested: AtomicBool::new(false),
     });
     let scheduler_inner = shared.clone();
     tauri::Builder::default()
@@ -1331,8 +1558,11 @@ pub fn run() {
             test_connection,
             check_destination,
             set_scheduler_paused,
+            authorize_sensitive_action,
+            clear_sensitive_authorization,
             start_backup,
             cancel_backup,
+            cancel_power_pause,
             list_backups,
             list_backup_entries,
             backup_file_versions,
@@ -1372,6 +1602,22 @@ pub fn run() {
             )?;
             let progress_item =
                 MenuItem::with_id(app.handle(), "tray_progress", "Idle", false, None::<&str>)?;
+            let cancel_item = MenuItem::with_id(
+                app.handle(),
+                "tray_cancel",
+                "Cancel backup",
+                false,
+                None::<&str>,
+            )?;
+            let auto_item = MenuItem::with_id(
+                app.handle(),
+                "tray_toggle_auto",
+                "Pause automatic backups",
+                true,
+                None::<&str>,
+            )?;
+            let separator_top = PredefinedMenuItem::separator(app.handle())?;
+            let separator_bottom = PredefinedMenuItem::separator(app.handle())?;
             let quit_item = MenuItem::with_id(
                 app.handle(),
                 "tray_quit",
@@ -1379,29 +1625,55 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
-            let tray_menu =
-                Menu::with_items(app.handle(), &[&open_item, &progress_item, &quit_item])?;
+            let tray_menu = Menu::with_items(
+                app.handle(),
+                &[
+                    &open_item,
+                    &progress_item,
+                    &separator_top,
+                    &cancel_item,
+                    &auto_item,
+                    &separator_bottom,
+                    &quit_item,
+                ],
+            )?;
             let tray_icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
             let tray = TrayIconBuilder::with_id("main")
                 .icon(tray_icon)
                 .icon_as_template(false)
                 .tooltip("Qia Backup")
                 .menu(&tray_menu)
-                .on_menu_event(|app, event| {
-                    if event.id() == "tray_open" {
-                        show_main_window(app);
-                    } else if event.id() == "tray_quit" {
-                        app.exit(0);
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "tray_open" => show_main_window(app),
+                    "tray_cancel" => {
+                        if let Some(inner) = app.try_state::<SharedState>() {
+                            if let Err(e) = request_cancel(inner.inner().as_ref()) {
+                                logging::debug(format!(
+                                    "tray could not cancel the running operation: {e}"
+                                ));
+                            }
+                        }
                     }
+                    "tray_toggle_auto" => {
+                        if let Some(inner) = app.try_state::<SharedState>() {
+                            let paused = inner.status.lock().scheduler_paused;
+                            set_scheduler_paused_inner(inner.inner().as_ref(), !paused);
+                        }
+                    }
+                    "tray_quit" => app.exit(0),
+                    _ => {}
                 })
                 .build(app.handle())?;
             app.manage(TrayState {
                 tray,
                 progress: progress_item,
+                cancel: cancel_item,
+                auto: auto_item,
                 _menu: tray_menu,
             });
             let status = app.state::<SharedState>().status.clone();
             spawn_tray_updater(app.handle().clone(), status);
+            spawn_power_watcher(app.state::<SharedState>().inner().clone());
 
             if let Some(window) = app.get_webview_window("main") {
                 let app_for_event = app.handle().clone();
@@ -1419,10 +1691,25 @@ pub fn run() {
             std::thread::spawn(move || {
                 loop {
                     std::thread::sleep(Duration::from_secs(30));
-                    let (paused, retry_at) = {
+                    let (paused, retry_at, power_paused) = {
                         let status = scheduler_inner.status.lock();
-                        (status.scheduler_paused, status.scheduler_retry_at)
+                        (
+                            status.scheduler_paused,
+                            status.scheduler_retry_at,
+                            status.power_paused,
+                        )
                     };
+                    if !scheduler_inner.power.can_run() {
+                        continue;
+                    }
+                    if power_paused {
+                        if let Err(e) =
+                            start_backup_inner(scheduler_inner.clone(), handle.clone(), "resumed")
+                        {
+                            logging::debug(format!("could not resume powered-off backup: {e}"));
+                        }
+                        continue;
+                    }
                     if paused {
                         continue;
                     }

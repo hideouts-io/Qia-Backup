@@ -16,6 +16,7 @@ pub mod index;
 pub mod logging;
 pub mod model;
 pub mod partial;
+pub mod power;
 pub mod preflight;
 pub mod record;
 pub mod recover;

@@ -15,7 +15,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use chrono::Utc;
@@ -39,7 +39,7 @@ use crate::core::record;
 use crate::core::recover;
 use crate::core::snapshot::{self, PreparedSource};
 use crate::core::store::BlobStore;
-use crate::core::upload::{UploadDone, UploadKind, UploadPool};
+use crate::core::upload::{MAX_UPLOAD_THREADS, UploadDone, UploadKind, UploadPool};
 
 /// Blobs up to one pack's worth are appended to a blobpack; larger ones are
 /// uploaded standalone. Trees are packed too, which keeps S3 object counts low
@@ -126,6 +126,13 @@ pub enum ProgressEvent {
     Upload {
         key: String,
         bytes: u64,
+    },
+    /// Live upload pool statistics for the transfer UI.
+    Transfer {
+        speed_bps: u64,
+        target_threads: u32,
+        max_threads: u32,
+        in_flight: u32,
     },
     Warning {
         message: String,
@@ -278,6 +285,8 @@ pub struct BackupEngine<'a> {
     upload_error: Option<String>,
     /// Live tree for browsing an in-progress run before its record exists.
     partial: Option<PartialTree>,
+    last_transfer_emit: Instant,
+    last_upload_target: usize,
 }
 
 impl<'a> BackupEngine<'a> {
@@ -324,6 +333,8 @@ impl<'a> BackupEngine<'a> {
             uploads,
             upload_error: None,
             partial,
+            last_transfer_emit: Instant::now(),
+            last_upload_target: 0,
         })
     }
 
@@ -702,6 +713,24 @@ impl<'a> BackupEngine<'a> {
         while let Some(done) = self.uploads.try_take() {
             self.handle_upload_done(done);
         }
+        self.uploads.tick();
+        self.emit_transfer_stats(false);
+    }
+
+    fn emit_transfer_stats(&mut self, force: bool) {
+        let stats = self.uploads.stats();
+        let changed = stats.target_threads != self.last_upload_target;
+        if !force && !changed && self.last_transfer_emit.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_transfer_emit = Instant::now();
+        self.last_upload_target = stats.target_threads;
+        (self.progress)(ProgressEvent::Transfer {
+            speed_bps: stats.speed_bps,
+            target_threads: stats.target_threads as u32,
+            max_threads: stats.max_threads as u32,
+            in_flight: stats.in_flight as u32,
+        });
     }
 
     /// Wait for every queued upload to finish and report the first real
@@ -711,6 +740,8 @@ impl<'a> BackupEngine<'a> {
         while let Some(done) = self.uploads.wait_one() {
             self.handle_upload_done(done);
         }
+        self.uploads.tick();
+        self.emit_transfer_stats(true);
         // A worker can disappear without reporting (panic or a broken done
         // channel). Never let the base index reference such blobs: drop them
         // so the next run re-uploads them instead of restoring from missing
@@ -1664,14 +1695,28 @@ pub fn run_backup_with_partial(
     }
 
     let plan = config.plan();
-    let threads = plan.thread_count.clamp(1, 16) as usize;
+    let configured_threads = plan.thread_count.clamp(1, 16) as usize;
+    let max_threads = MAX_UPLOAD_THREADS;
+    // Start conservatively and let measured throughput ramp the pool up. The
+    // configured thread count is only a starting hint; a slow link quickly
+    // scales back to one worker and a fast link grows toward the hard cap.
+    let initial_threads = configured_threads.clamp(1, 2);
     let pack_limit = config
         .pack_size_bytes
         .clamp(1024 * 1024, 5 * 1024 * 1024 * 1024) as usize;
-    let budget = threads.saturating_mul(pack_limit).min(1024 * 1024 * 1024);
+    let budget = max_threads
+        .saturating_mul(pack_limit)
+        .min(1024 * 1024 * 1024);
 
     std::thread::scope(|scope| {
-        let uploads = UploadPool::start(scope, store, cancel.clone(), threads, budget);
+        let uploads = UploadPool::start_with_target(
+            scope,
+            store,
+            cancel.clone(),
+            max_threads,
+            initial_threads,
+            budget,
+        );
         let mut engine = BackupEngine::new(
             store,
             config,
@@ -1814,6 +1859,14 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, ProgressEvent::Finished { .. }))
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProgressEvent::Transfer { max_threads, .. }
+                    if *max_threads == MAX_UPLOAD_THREADS as u32
+            )),
+            "backup should report upload pool statistics"
         );
         let first_totals = events.iter().find_map(|e| match e {
             ProgressEvent::Totals { files, bytes } => Some((*files, *bytes)),

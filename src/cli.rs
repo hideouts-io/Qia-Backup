@@ -453,6 +453,19 @@ fn cmd_backup(args: BackupArgs) -> Result<()> {
                     println!("  uploaded {key} ({bytes} bytes)");
                 }
             }
+            ProgressEvent::Transfer {
+                speed_bps,
+                target_threads,
+                max_threads,
+                in_flight,
+            } => {
+                if verbose {
+                    println!(
+                        "  transfer {:.1} MB/s, {in_flight}/{target_threads} active (max {max_threads})",
+                        speed_bps as f64 / (1024.0 * 1024.0)
+                    );
+                }
+            }
             ProgressEvent::Warning { message } => eprintln!("warning: {message}"),
             ProgressEvent::Finished { .. } => {}
         },
