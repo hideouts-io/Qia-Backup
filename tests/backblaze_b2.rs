@@ -8,13 +8,16 @@
 
 use std::path::Path;
 
+use qia_backup::core::diff::{self, ChangeKind, EntryKind, FileDiffRowKind};
 use qia_backup::core::engine::{CancelToken, run_backup};
 use qia_backup::core::error::{BackupError, Result};
 use qia_backup::core::index::BlobIndex;
 use qia_backup::core::model::{AppConfig, StorageProvider};
 use qia_backup::core::record;
-use qia_backup::core::restore::restore_backup;
+use qia_backup::core::restore::{self, restore_backup};
+use qia_backup::core::retention;
 use qia_backup::core::store::{BlobStore, S3Config, S3Store, new_store};
+use qia_backup::core::versions;
 
 fn required_env(name: &str) -> Result<String> {
     let value = std::env::var(name).map_err(|_| {
@@ -35,6 +38,150 @@ fn verify_bytes(actual: &[u8], expected: &[u8], operation: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn verify_record_views(
+    config: &AppConfig,
+    store: &dyn BlobStore,
+    first_record: &str,
+    second_record: &str,
+) -> Result<()> {
+    let changes = diff::diff_backup(config, store, second_record, Some(first_record), 0)?;
+    let [entry] = changes.entries.as_slice() else {
+        return Err(BackupError::Other(
+            "live B2 test: record diff did not report exactly one changed entry".into(),
+        ));
+    };
+    if changes.truncated
+        || changes.added != 0
+        || changes.modified != 1
+        || changes.deleted != 0
+        || entry.path != "changed.txt"
+        || entry.change != ChangeKind::Modified
+        || entry.kind != EntryKind::File
+    {
+        return Err(BackupError::Other(
+            "live B2 test: record diff misidentified the modified file".into(),
+        ));
+    }
+
+    let text_diff = diff::diff_file_text(
+        config,
+        store,
+        second_record,
+        Some(first_record),
+        "changed.txt",
+    )?;
+    let [row] = text_diff.rows.as_slice() else {
+        return Err(BackupError::Other(
+            "live B2 test: text diff did not return the changed line".into(),
+        ));
+    };
+    if text_diff.binary
+        || text_diff.truncated
+        || text_diff.message.is_some()
+        || row.kind != FileDiffRowKind::Changed
+        || row.left.as_deref() != Some("first revision")
+        || row.right.as_deref() != Some("second revision, with more bytes")
+    {
+        return Err(BackupError::Other(
+            "live B2 test: text diff did not recover both encrypted revisions".into(),
+        ));
+    }
+
+    let history = versions::file_versions(config, store, "changed.txt", Some(first_record))?;
+    let [newest, oldest] = history.versions.as_slice() else {
+        return Err(BackupError::Other(
+            "live B2 test: expected two distinct file versions".into(),
+        ));
+    };
+    if newest.record_key != second_record
+        || oldest.record_key != first_record
+        || newest.selected
+        || !oldest.selected
+        || newest.occurrences != 1
+        || oldest.occurrences != 1
+    {
+        return Err(BackupError::Other(
+            "live B2 test: file version order or selected revision is incorrect".into(),
+        ));
+    }
+    let counts = versions::version_counts(config, store, "")?;
+    if counts
+        .counts
+        .iter()
+        .find(|item| item.path == "changed.txt")
+        .map(|item| item.versions)
+        != Some(2)
+        || counts
+            .counts
+            .iter()
+            .find(|item| item.path == "unchanged.bin")
+            .map(|item| item.versions)
+            != Some(1)
+    {
+        return Err(BackupError::Other(
+            "live B2 test: version counts did not distinguish changed and reused content".into(),
+        ));
+    }
+
+    // The public restore helper reaches core::content and loads the encrypted
+    // keyset and record through this real store, exactly as the viewer does.
+    for (record_key, expected) in [
+        (first_record, "first revision"),
+        (second_record, "second revision, with more bytes"),
+    ] {
+        let preview = restore::read_file_content(config, store, Some(record_key), "changed.txt")?;
+        if preview.binary
+            || preview.too_large
+            || preview.message.is_some()
+            || preview.path != "changed.txt"
+            || preview.size != expected.len() as u64 + 1
+            || preview.text.as_deref() != Some(expected)
+        {
+            return Err(BackupError::Other(
+                "live B2 test: read-only preview did not show the selected encrypted revision"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_and_verify(
+    config: &AppConfig,
+    store: &dyn BlobStore,
+    record_key: &str,
+    destination: &Path,
+    unchanged_bytes: &[u8],
+    changed_bytes: &[u8],
+) -> Result<()> {
+    let restored = restore_backup(
+        config,
+        store,
+        record_key,
+        destination,
+        CancelToken::new(),
+        &mut |_| {},
+    )?;
+    if restored.errors != 0
+        || restored.files != 2
+        || restored.bytes != (unchanged_bytes.len() + changed_bytes.len()) as u64
+    {
+        return Err(BackupError::Other(
+            "live B2 test: restore did not recover both complete files cleanly".into(),
+        ));
+    }
+    verify_bytes(
+        &std::fs::read(destination.join("unchanged.bin"))?,
+        unchanged_bytes,
+        "restore unchanged file",
+    )?;
+    verify_bytes(
+        &std::fs::read(destination.join("changed.txt"))?,
+        changed_bytes,
+        "restore changed revision",
+    )
 }
 
 fn exercise_backup(config: &mut AppConfig, store: &dyn BlobStore, fixture: &Path) -> Result<()> {
@@ -107,43 +254,58 @@ fn exercise_backup(config: &mut AppConfig, store: &dyn BlobStore, fixture: &Path
         ));
     }
 
+    verify_record_views(config, store, &first.record_key, &second.record_key)?;
     for (record_key, directory, changed_bytes) in [
         (
-            first.record_key,
+            first.record_key.as_str(),
             "restore-first",
             b"first revision\n".as_slice(),
         ),
         (
-            second.record_key,
+            second.record_key.as_str(),
             "restore-second",
             b"second revision, with more bytes\n".as_slice(),
         ),
     ] {
         let destination = fixture.join(directory);
-        let restored = restore_backup(
+        restore_and_verify(
             config,
             store,
-            &record_key,
+            record_key,
             &destination,
-            CancelToken::new(),
-            &mut |_| {},
-        )?;
-        if restored.errors != 0 || restored.files != 2 {
-            return Err(BackupError::Other(format!(
-                "live B2 test: {directory} did not restore both files cleanly"
-            )));
-        }
-        verify_bytes(
-            &std::fs::read(destination.join("unchanged.bin"))?,
             &original,
-            "restore unchanged file",
-        )?;
-        verify_bytes(
-            &std::fs::read(destination.join("changed.txt"))?,
             changed_bytes,
-            "restore changed revision",
         )?;
     }
+
+    let prune_config = AppConfig {
+        retain_all: false,
+        retain_hours: 0,
+        retain_days: 0,
+        retain_weeks: 0,
+        retain_months: 0,
+        ..config.clone()
+    };
+    let pruned = retention::prune(&prune_config, store, &CancelToken::new(), false)?;
+    let records = record::list_record_keys(store, &config.key_root(), &config.backup_set_uuid)?;
+    if pruned.records_before != 2
+        || pruned.records_kept != 1
+        || pruned.records_deleted != 1
+        || records != [second.record_key.clone()]
+        || store.head(&first.record_key)?.is_some()
+    {
+        return Err(BackupError::Other(
+            "live B2 test: retention did not delete only the older backup record".into(),
+        ));
+    }
+    restore_and_verify(
+        &prune_config,
+        store,
+        &second.record_key,
+        &fixture.join("restore-after-prune"),
+        &original,
+        b"second revision, with more bytes\n",
+    )?;
     Ok(())
 }
 

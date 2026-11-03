@@ -11,6 +11,7 @@ use filetime::{FileTime, set_file_mtime};
 use serde::Serialize;
 
 use crate::core::config::{self, BackupListEntry};
+use crate::core::content;
 use crate::core::crypto::{MasterKeys, decrypt_keyset};
 use crate::core::engine::CancelToken;
 use crate::core::error::{BackupError, IoContext, Result};
@@ -216,6 +217,20 @@ fn sort_backup_entries(entries: &mut [BackupEntry]) {
     });
 }
 
+/// Read one file's text content from a completed record for the viewer.
+pub fn read_file_content(
+    config: &AppConfig,
+    store: &dyn BlobStore,
+    record_key: Option<&str>,
+    path: &str,
+) -> Result<content::FileContent> {
+    let root = config.key_root();
+    let (keys, record, _) = load_record_with_keys(config, store, record_key)?;
+    let normalized = normalize_backup_path(path)?;
+    let node = find_node(store, &root, keys.as_ref(), &record, &normalized)?;
+    content::node_content(&normalized, &node, store, &root, keys.as_ref())
+}
+
 /// Restore one file or folder from a backup record into `destination`.
 ///
 /// A selected folder is created inside `destination` under its own name; a
@@ -325,6 +340,20 @@ pub fn list_partial_entries(
     })
 }
 
+/// Read one file's text content from the live partial backup for the viewer.
+pub fn read_partial_file_content(
+    config: &AppConfig,
+    store: &dyn BlobStore,
+    partial: &PartialTree,
+    path: &str,
+) -> Result<content::FileContent> {
+    let root = config.key_root();
+    ensure_partial_destination(store, &root)?;
+    let keys = load_keys(config, store, &root)?;
+    let (normalized, node) = partial_resolve_node(store, &root, keys.as_ref(), partial, path)?;
+    content::node_content(&normalized, &node, store, &root, keys.as_ref())
+}
+
 fn partial_dir_children(
     store: &dyn BlobStore,
     root: &str,
@@ -349,7 +378,7 @@ fn partial_dir_children(
     Ok(record::load_tree_checked(store, root, loc, keys)?.children)
 }
 
-fn partial_resolve_node(
+pub(crate) fn partial_resolve_node(
     store: &dyn BlobStore,
     root: &str,
     keys: Option<&MasterKeys>,

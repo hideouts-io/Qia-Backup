@@ -32,9 +32,11 @@ mechanism Time Machine uses locally) and stores them in **AWS S3 or Backblaze B2
 - Packs large data blobs into 64 MiB blobpacks instead of writing one S3 object
   per chunk. A 1.5 TB first backup is tens of thousands of objects rather than
   millions, without changing the 1 MiB chunking that existing blob IDs use.
-- Uploads blobpacks and tree objects on a small worker pool (four concurrent
-  PUTs by default) while the file walk continues, rather than serializing every
-  upload behind the scan. In-flight upload memory is bounded.
+- Uploads blobpacks and tree objects on a dynamically scaled worker pool while
+  the file walk continues, rather than serializing every upload behind the
+  scan. The pool starts conservatively and grows up to 16 concurrent PUTs as
+  measured throughput increases (four workers around 5 MB/s, matching four
+  64 MiB packs in roughly a minute). In-flight upload memory is bounded.
 - Stores data in content-addressed containers: `blobpacks/`, `treepacks/`,
   `standardobjects/`, JSON configuration files, and LZ4-compressed
   `.backuprecord` files under `backupfolders/<uuid>/backuprecords/`.
@@ -53,6 +55,11 @@ mechanism Time Machine uses locally) and stores them in **AWS S3 or Backblaze B2
   packs and objects.
 - Runs backups manually, on an interval (default hourly, like Time Machine's local
   snapshots), or through the CLI daemon/launchd.
+- Pauses backups on battery power and while the Mac sleeps. Automatic and
+  manual runs resume only after five minutes of stable AC power; a power-paused
+  run remembers its progress and can be cancelled from the Dashboard.
+- Shows live upload throughput, active/max worker counts, uploaded bytes, and a
+  rolling speed sparkline while a backup runs.
 
 Destinations use the S3 protocol: AWS S3 and Backblaze B2 are supported. The
 backup format, encryption, incremental backups, retention and restore are shared.
@@ -314,11 +321,20 @@ independent of the Mac, and keep a copy of the config if possible.
    Use **Test connection** to verify the bucket and (if enabled) the
    encryption password.
 3. **Save settings**.
-4. **Dashboard** → **Back Up Now**. Progress, files, bytes read/uploaded and
-   activity are live. The Dashboard also shows an estimated monthly S3 cost
-   based on the bytes currently stored under this backup set.
+4. **Dashboard** → **Back up to AWS S3** or **Back up to Backblaze B2**. Progress, files, bytes read/uploaded,
+   upload speed, active upload workers and activity are live. The Dashboard
+   also shows an estimated monthly S3 cost based on the bytes currently stored
+   under this backup set. Backups pause on battery power or while the Mac
+   sleeps and resume after five minutes of stable power; **Don't resume**
+   cancels a power-paused run.
 5. **Backups** lists completed records and offers **Changes** (added, modified
    and deleted files vs. the previous record), restore, prune and delete-set.
+   Restore, Ignore, Remove, Restore entire backup, Cancel backup, Delete backup
+   set and Clear log all ask for confirmation. Removing a file or deleting the
+   backup set additionally requires Touch ID/Face ID or the macOS account
+   password **before** the confirmation dialog; the matching backend command
+   also rejects the request unless that one-shot authorization grant is
+   present.
    In **Changes**, a modified file can be opened in a side-by-side diff that
    aligns removed and added lines. Binary files and files above the diff size
    limit are intentionally not diffed. A running backup is shown on the
@@ -326,15 +342,20 @@ independent of the Mac, and keep a copy of the config if possible.
 6. **Files** is the single restore surface: browse the latest completed backup,
    a specific revision, or the live **Partial current backup** while a run is
    active. The **Versions** column counts distinct content versions across
-   completed backups. Restore one file or folder by choosing the exact version
-   to bring back, or restore the whole backup to a chosen folder. Partial
-   restore is available after stopping/cancelling the active run.
+   completed backups. Use **Show content** to preview text files and **Diff**
+   to compare a completed file with its previous revision (or a partial file
+   with the latest completed backup). Binary and large files are intentionally
+   excluded from previews and diffs. Restore one file or folder by choosing the
+   exact version to bring back, or restore the whole backup to a chosen folder.
+   Partial restore is available after stopping/cancelling the active run.
 7. **Activity** shows the log and can open the log/config folders.
 
 Closing the window hides Qia Backup to the macOS menu bar instead of quitting,
-so scheduled backups continue. The tray menu offers **Open Qia Backup** and
-**Quit Qia Backup**, and the tray title shows the current backup percentage
-while a run is active.
+so scheduled backups continue. The tray menu offers **Open Qia Backup**,
+**Cancel backup** (or **Cancel restore**) while an operation is running,
+**Pause automatic backups** / **Resume automatic backups**, and **Quit Qia
+Backup**. The tray title shows the current backup percentage while a run is
+active.
 
 Settings are stored at:
 

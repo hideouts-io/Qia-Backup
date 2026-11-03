@@ -9,9 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use crate::core::content::{TextSide, read_text_side, unsupported_message};
 use crate::core::crypto::MasterKeys;
 use crate::core::error::{BackupError, Result};
 use crate::core::model::{AppConfig, BlobLoc, Node, Tree};
+use crate::core::partial::PartialTree;
 use crate::core::record;
 use crate::core::restore;
 use crate::core::store::BlobStore;
@@ -99,9 +101,9 @@ impl DiffSummary {
 }
 
 /// Maximum number of bytes read from each side of a text diff.
-pub const MAX_TEXT_DIFF_BYTES: u64 = 2 * 1024 * 1024;
+pub use crate::core::content::MAX_TEXT_BYTES as MAX_TEXT_DIFF_BYTES;
 /// Maximum number of lines compared and returned for each side.
-pub const MAX_TEXT_DIFF_LINES: usize = 4_000;
+pub use crate::core::content::MAX_TEXT_LINES as MAX_TEXT_DIFF_LINES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -207,48 +209,15 @@ pub fn diff_file_between(
         rows: Vec::new(),
     };
 
-    let mut left = TextSide::default();
-    let mut right = TextSide::default();
-
-    for node in [&older_node, &newer_node].into_iter().flatten() {
-        if let Some(message) = unsupported_message(node) {
-            diff.message = Some(message);
-            return Ok(diff);
-        }
-        if node.item_size > MAX_TEXT_DIFF_BYTES {
-            diff.message = Some(too_large_message());
-            return Ok(diff);
-        }
-    }
-
-    if older_node.is_none() && newer_node.is_none() {
-        diff.message = Some("This path does not exist in either version.".into());
-        return Ok(diff);
-    }
-
-    if let Some(node) = &older_node {
-        left = read_text_side(store, root, keys, node)?;
-    }
-    if let Some(node) = &newer_node {
-        right = read_text_side(store, root, keys, node)?;
-    }
-
-    diff.binary = left.binary || right.binary;
-    diff.truncated = left.truncated || right.truncated;
-    if diff.binary {
-        diff.message = Some("Binary file — binary files are not diffed.".into());
-        return Ok(diff);
-    }
-    if diff.truncated {
-        diff.message = Some(too_large_message());
-        return Ok(diff);
-    }
-
-    diff.rows = build_side_by_side(&left.lines, &right.lines);
+    let result = diff_node_pair(store, root, keys, older_node.as_ref(), newer_node.as_ref())?;
+    diff.binary = result.binary;
+    diff.truncated = result.truncated;
+    diff.message = result.message;
+    diff.rows = result.rows;
     Ok(diff)
 }
 
-fn too_large_message() -> String {
+fn too_large_diff_message() -> String {
     format!(
         "This file is too large to diff (limit {} MB or {} lines).",
         MAX_TEXT_DIFF_BYTES / (1024 * 1024),
@@ -257,69 +226,128 @@ fn too_large_message() -> String {
 }
 
 #[derive(Default)]
-struct TextSide {
-    lines: Vec<String>,
+struct NodeDiff {
+    rows: Vec<FileDiffRow>,
     binary: bool,
     truncated: bool,
+    message: Option<String>,
 }
 
-fn unsupported_message(node: &Node) -> Option<String> {
-    if node.is_tree || Node::mode_is_dir(node.mac_st_mode) {
-        Some("Directories do not have text content to compare.".into())
-    } else if Node::mode_is_symlink(node.mac_st_mode) {
-        Some("Symlink targets are not shown in the text diff.".into())
-    } else {
-        None
-    }
-}
-
-fn read_text_side(
+fn diff_node_pair(
     store: &dyn BlobStore,
     root: &str,
     keys: Option<&MasterKeys>,
-    node: &Node,
-) -> Result<TextSide> {
-    let mut bytes = Vec::new();
-    for loc in &node.data_blob_locs {
-        let data = record::load_node_blob(store, root, loc, keys)?;
-        if bytes.len() as u64 + data.len() as u64 > MAX_TEXT_DIFF_BYTES {
-            return Ok(TextSide {
-                lines: Vec::new(),
-                binary: false,
-                truncated: true,
+    left_node: Option<&Node>,
+    right_node: Option<&Node>,
+) -> Result<NodeDiff> {
+    for node in [left_node, right_node].into_iter().flatten() {
+        if let Some(message) = unsupported_message(node) {
+            return Ok(NodeDiff {
+                message: Some(message),
+                ..NodeDiff::default()
             });
         }
-        bytes.extend_from_slice(&data);
+        if node.item_size > MAX_TEXT_DIFF_BYTES {
+            return Ok(NodeDiff {
+                message: Some(too_large_diff_message()),
+                ..NodeDiff::default()
+            });
+        }
     }
 
-    let binary = bytes.contains(&0);
+    if left_node.is_none() && right_node.is_none() {
+        return Ok(NodeDiff {
+            message: Some("This path does not exist in either version.".into()),
+            ..NodeDiff::default()
+        });
+    }
+
+    let left = match left_node {
+        Some(node) => read_text_side(store, root, keys, node)?,
+        None => TextSide::default(),
+    };
+    let right = match right_node {
+        Some(node) => read_text_side(store, root, keys, node)?,
+        None => TextSide::default(),
+    };
+
+    let binary = left.binary || right.binary;
+    let truncated = left.truncated || right.truncated;
     if binary {
-        return Ok(TextSide {
-            lines: Vec::new(),
-            binary: true,
-            truncated: false,
+        return Ok(NodeDiff {
+            binary,
+            truncated,
+            message: Some("Binary file — binary files are not diffed.".into()),
+            ..NodeDiff::default()
+        });
+    }
+    if truncated {
+        return Ok(NodeDiff {
+            binary,
+            truncated,
+            message: Some(too_large_diff_message()),
+            ..NodeDiff::default()
         });
     }
 
-    let text = String::from_utf8_lossy(&bytes);
-    let mut lines: Vec<String> = text
-        .split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
-        .collect();
-    if lines.last().is_some_and(|line| line.is_empty()) {
-        lines.pop();
+    Ok(NodeDiff {
+        rows: build_side_by_side(&left.lines, &right.lines),
+        binary,
+        truncated,
+        message: None,
+    })
+}
+
+/// Compare the same path in the latest completed record with the live partial
+/// backup. This is the partial-backup counterpart of [`diff_file_text`].
+pub fn diff_partial_file(
+    config: &AppConfig,
+    store: &dyn BlobStore,
+    partial: &PartialTree,
+    path: &str,
+) -> Result<FileDiff> {
+    let root = config.key_root();
+    if !record::partial_run_exists(store, &root)? {
+        return Err(BackupError::Other(
+            "the destination no longer contains this partial backup; local partial data was discarded"
+                .into(),
+        ));
     }
-    if lines.len() > MAX_TEXT_DIFF_LINES {
-        return Ok(TextSide {
-            lines: Vec::new(),
-            binary: false,
-            truncated: true,
-        });
-    }
-    Ok(TextSide {
-        lines,
-        binary: false,
-        truncated: false,
+    let keys = restore::load_keys(config, store, &root)?;
+    let normalized = restore::normalize_backup_path(path)?;
+    let (_, partial_node) =
+        restore::partial_resolve_node(store, &root, keys.as_ref(), partial, &normalized)?;
+
+    let baseline_key = record::latest_record_key(store, &root, &config.backup_set_uuid)?;
+    let (previous_timestamp, baseline_node) = match &baseline_key {
+        Some(key) => {
+            let record = record::load_record(store, key, keys.as_ref())?;
+            let node = restore::find_node_opt(store, &root, keys.as_ref(), &record, &normalized)?;
+            (record::record_timestamp(key), node)
+        }
+        None => (None, None),
+    };
+
+    let result = diff_node_pair(
+        store,
+        &root,
+        keys.as_ref(),
+        baseline_node.as_ref(),
+        Some(&partial_node),
+    )?;
+
+    Ok(FileDiff {
+        path: normalized,
+        record_key: "partial".into(),
+        previous_record_key: baseline_key,
+        record_timestamp: None,
+        previous_timestamp,
+        left_size: baseline_node.as_ref().map_or(0, |node| node.item_size),
+        right_size: partial_node.item_size,
+        binary: result.binary,
+        truncated: result.truncated,
+        message: result.message,
+        rows: result.rows,
     })
 }
 
@@ -969,7 +997,7 @@ mod tests {
     use base64::Engine as _;
     use serde_json::json;
 
-    const ROOT: &str = "prefix/set";
+    const ROOT: &str = "prefix/folder";
     const FOLDER: &str = "folder";
 
     fn temp_store() -> LocalStore {
@@ -1060,6 +1088,13 @@ mod tests {
             mac_st_mode: libc::S_IFDIR as u32 | 0o755,
             ..Node::default()
         }
+    }
+
+    fn config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.prefix = "prefix".into();
+        config.backup_set_uuid = FOLDER.into();
+        config
     }
 
     fn write_record(store: &LocalStore, epoch: i64, root_node: &Node) -> String {
@@ -1309,5 +1344,36 @@ mod tests {
         let diff = diff_file_between(&store, ROOT, &new, Some(&old), None, "big.txt").unwrap();
         assert!(diff.rows.is_empty());
         assert!(diff.message.unwrap_or_default().contains("too large"));
+    }
+
+    #[test]
+    fn partial_diff_uses_latest_completed_baseline() {
+        let store = temp_store();
+        let baseline = write_record(
+            &store,
+            100,
+            &dir(&store, vec![("a.txt", file_node(&store, "one\ntwo\n", 10))]),
+        );
+        store.put(&record::partial_run_key(ROOT), b"{}").unwrap();
+
+        let partial = crate::core::partial::PartialTree::new();
+        partial.publish_dir(
+            "",
+            dir(
+                &store,
+                vec![("a.txt", file_node(&store, "one\ntwo\nthree\n", 10))],
+            ),
+            &[("a.txt".into(), file_node(&store, "one\ntwo\nthree\n", 10))],
+            false,
+        );
+
+        let diff = diff_partial_file(&config(), &store, &partial, "a.txt").unwrap();
+        assert_eq!(diff.record_key, "partial");
+        assert_eq!(diff.previous_record_key.as_deref(), Some(baseline.as_str()));
+        assert_eq!(diff.previous_timestamp, record::record_timestamp(&baseline));
+        assert_eq!(diff.rows.len(), 3);
+        assert_eq!(diff.rows[0].kind, FileDiffRowKind::Same);
+        assert_eq!(diff.rows[2].kind, FileDiffRowKind::Added);
+        assert_eq!(diff.rows[2].right.as_deref(), Some("three"));
     }
 }

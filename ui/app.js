@@ -1,7 +1,13 @@
 /* global window, document, setInterval, clearTimeout */
 
 const tauri = window.__TAURI__;
-const invoke = tauri?.core?.invoke;
+const nativeInvoke = tauri?.core?.invoke;
+const invoke = nativeInvoke
+  ? (command, args) => nativeInvoke(command, {
+      ...args,
+      expectedProvider: state.config?.storageProvider || "aws_s3",
+    })
+  : undefined;
 const listen = tauri?.event?.listen;
 const demo = !invoke;
 
@@ -79,6 +85,10 @@ const state = {
   restoreRequest: 0,
   fileDiff: null,
   fileDiffRequest: 0,
+  contentRequest: 0,
+  confirmResolve: null,
+  speedHistory: [],
+  lastSpeedSampleAt: 0,
   storageEstimate: null,
   estimateAt: 0,
   estimateError: "",
@@ -108,6 +118,10 @@ function fmtBytes(n) {
   let i = 0;
   while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
   return `${n >= 100 || i === 0 ? Math.round(n) : n.toFixed(1)} ${units[i]}`;
+}
+
+function fmtSpeed(n) {
+  return `${fmtBytes(n)}/s`;
 }
 
 function backupProgress(s) {
@@ -219,12 +233,55 @@ function renderBanner() {
   }
   if (s.running) { banner(""); return; }
   if (s.lastError) { banner(s.lastError, true); return; }
+  if (s.powerPaused) { banner(""); return; }
+  if (s.powerMessage) { banner(s.powerMessage); return; }
   if (state.destinationCheck && !state.destinationCheck.canBackup) {
     const paused = s.schedulerPaused ? " Automatic backups are paused." : "";
     banner(`${state.destinationCheck.message}${paused}`, true);
     return;
   }
   banner("");
+}
+
+function confirmAction({ title, message, detail = "", confirmLabel = "Confirm", danger = false }) {
+  if (state.confirmResolve) state.confirmResolve(false);
+  return new Promise((resolve) => {
+    state.confirmResolve = resolve;
+    $("confirm-title").textContent = title;
+    $("confirm-message").textContent = message;
+    $("confirm-detail").textContent = detail;
+    $("confirm-detail").classList.toggle("hidden", !detail);
+    const accept = $("confirm-accept");
+    accept.textContent = confirmLabel;
+    accept.classList.toggle("danger", !!danger);
+    accept.classList.toggle("primary", !danger);
+    $("confirm-modal").classList.remove("hidden");
+    window.setTimeout(() => accept.focus(), 0);
+  });
+}
+
+function closeConfirm(result) {
+  if (!state.confirmResolve) return;
+  const resolve = state.confirmResolve;
+  state.confirmResolve = null;
+  $("confirm-modal").classList.add("hidden");
+  resolve(result);
+}
+
+async function authorizeSensitive(action) {
+  if (demo || !invoke) return true;
+  try {
+    await invoke("authorize_sensitive_action", { action });
+    return true;
+  } catch (e) {
+    toast(String(e), true);
+    return false;
+  }
+}
+
+async function clearSensitiveAuthorization() {
+  if (demo || !invoke) return;
+  try { await invoke("clear_sensitive_authorization"); } catch (_) { /* ignore */ }
 }
 
 function showView(name) {
@@ -253,6 +310,27 @@ function providerName(provider) {
   return provider === "backblaze_b2" ? "Backblaze B2" : "AWS S3";
 }
 
+function destinationIdentity(config) {
+  const provider = config?.storageProvider || "aws_s3";
+  const bucket = String(config?.bucket || "").trim();
+  return JSON.stringify([
+    provider,
+    String(config?.endpoint || "").trim().replace(/\/+$/g, ""),
+    provider === "backblaze_b2" ? bucket.toLowerCase() : bucket,
+    String(config?.region || "").trim(),
+    String(config?.prefix || "").replace(/^\/+|\/+$/g, ""),
+    config?.backupSetUuid || "",
+  ]);
+}
+
+function acceptSavedConfig(saved) {
+  if (destinationIdentity(saved) !== destinationIdentity(state.config)) resetDestinationView();
+  state.settingsDrafts.delete(saved.storageProvider || "aws_s3");
+  state.settingsDirty = false;
+  state.config = saved;
+  state.estimateAt = 0;
+}
+
 function saveSettingsDraft() {
   if (!state.settingsDirty || !state.config) return;
   const provider = selectedProvider();
@@ -270,6 +348,8 @@ function resetDestinationView() {
   state.versionCountsRequest += 1;
   state.restoreRequest += 1;
   state.fileDiffRequest += 1;
+  state.contentRequest += 1;
+  state.lastRunning = false;
   state.backups = [];
   state.filesRecordKey = "";
   state.filesPath = "";
@@ -289,13 +369,15 @@ function resetDestinationView() {
   state.progressStart = null;
   state.progressRun = null;
   $("test-result").textContent = "";
-  ["diff-modal", "file-diff-modal", "restore-modal"].forEach((id) => $(id)?.classList.add("hidden"));
+  closeConfirm(false);
+  ["diff-modal", "file-diff-modal", "restore-modal", "content-modal"].forEach((id) => $(id)?.classList.add("hidden"));
 }
 
 function applyBootstrap(boot) {
   const nextProvider = boot.selectedProvider || boot.config.storageProvider || "aws_s3";
   saveSettingsDraft();
-  if (state.config && nextProvider !== selectedProvider()) {
+  if (state.config && (nextProvider !== selectedProvider()
+      || destinationIdentity(boot.config) !== destinationIdentity(state.config))) {
     resetDestinationView();
   }
   state.destinations = boot.destinations || [];
@@ -330,8 +412,10 @@ function renderDestinations() {
     $(`destination-${suffix}-bucket`).textContent = configured
       ? `${profile.bucket} · ${profile.backupSetName || "Backup set"}${profile.schedulerPaused === false ? " · Auto on" : ""}`
       : `Configure ${providerName(provider)} in Settings.`;
-    $(`backup-${suffix}`).disabled = busy;
-    $(`backup-${suffix}`).title = configured ? "Back up using this destination's saved settings" : "Open this destination's Settings first";
+    const powerBlocked = !busy && !!state.status?.powerMessage;
+    $(`backup-${suffix}`).disabled = busy || powerBlocked;
+    $(`backup-${suffix}`).title = powerBlocked ? state.status.powerMessage
+      : (configured ? "Back up using this destination's saved settings" : "Open this destination's Settings first");
     $(`select-${suffix}`).disabled = busy;
     $(`select-${suffix}`).setAttribute("aria-pressed", String(selected));
   }
@@ -473,7 +557,7 @@ function applyConfig(cfg) {
   $("prefix").value = cfg.prefix || "";
   $("backup-set-uuid").value = cfg.backupSetUuid || "";
   $("access-key").value = cfg.accessKeyId || "";
-  $("secret-key").value = "";
+  $("secret-key").value = draft ? (draft.secretAccessKey || "") : "";
   $("snapshot-volume").value = cfg.snapshotVolume || "/System/Volumes/Data";
   $("included-folders").value = (cfg.includedFolders || []).join("\n");
   $("excludes").value = (cfg.excludePatterns || []).join("\n");
@@ -485,7 +569,7 @@ function applyConfig(cfg) {
   $("retain-months").value = cfg.retainMonths ?? 12;
   updateRetentionUI();
   $("encryption-enabled").checked = !!cfg.encryptionEnabled;
-  $("encryption-password").value = "";
+  $("encryption-password").value = draft ? (draft.encryptionPassword || "") : "";
   $("encryption-password").placeholder = state.hasEncryptionPassword
     ? "Saved in macOS Keychain — leave blank to keep"
     : "Encryption password";
@@ -666,6 +750,54 @@ async function refreshEstimate(force = false) {
   }
 }
 
+function renderTransferSpark() {
+  const el = $("transfer-spark");
+  if (!el) return;
+  const history = state.speedHistory;
+  if (!history.length) { el.innerHTML = ""; return; }
+  const max = Math.max(1, ...history.map((sample) => sample.bps));
+  el.innerHTML = history.map((sample) => {
+    const height = Math.max(6, Math.round((sample.bps / max) * 100));
+    return `<span style="height:${height}%" title="${esc(fmtSpeed(sample.bps))}"></span>`;
+  }).join("");
+}
+
+function renderTransfer(s) {
+  const active = !!s.running && !s.restoring;
+  const speed = Number(s.uploadSpeedBps || 0);
+  const target = Number(s.uploadTargetThreads || 0);
+  const max = Number(s.uploadMaxThreads || 0);
+  const inFlight = Number(s.uploadInFlight || 0);
+  $("progress-speed").textContent = active
+    ? (speed > 0 ? fmtSpeed(speed) : (inFlight > 0 ? "measuring…" : "0 B/s"))
+    : "—";
+  $("progress-transfer").textContent = active
+    ? `${fmtBytes(s.bytesUploaded)} uploaded`
+    : "Waiting for uploads…";
+  $("progress-workers").textContent = active && target > 0
+    ? `${inFlight} active · ${target}/${max} workers`
+    : (active ? "Starting upload workers…" : "");
+  if (!active) return;
+  const now = Date.now();
+  if (now - state.lastSpeedSampleAt >= 3000) {
+    state.speedHistory.push({ at: now, bps: speed });
+    if (state.speedHistory.length > 30) state.speedHistory.shift();
+    state.lastSpeedSampleAt = now;
+    renderTransferSpark();
+  }
+}
+
+function updatePowerPause() {
+  const el = $("power-pause");
+  if (!el) return;
+  const paused = !!state.status?.powerPaused;
+  el.classList.toggle("hidden", !paused);
+  if (paused) {
+    $("power-pause-message").textContent = state.status?.powerMessage
+      || "Power conditions paused the backup. It will resume automatically after five minutes of stable power.";
+  }
+}
+
 function updateStatus() {
   const s = state.status || {};
   const running = !!s.running;
@@ -684,6 +816,9 @@ function updateStatus() {
   } else if (s.lastError) {
     pill.classList.add("error");
     text.textContent = "Needs attention";
+  } else if (s.powerPaused || s.powerMessage) {
+    pill.classList.add("paused");
+    text.textContent = "Paused";
   } else if (s.lastSummary) {
     pill.classList.add("success");
     text.textContent = "Ready";
@@ -744,6 +879,7 @@ function updateStatus() {
       $("progress-upload").textContent = `${fmtBytes(s.bytesUploaded)} uploaded`;
       $("progress-percent").textContent = fmtPercent(progress);
     }
+    renderTransfer(s);
     const bar = $("progress-bar");
     if (pct == null) {
       bar.classList.add("indeterminate");
@@ -755,6 +891,7 @@ function updateStatus() {
       bar.title = `${fmtFileProgress(s)} (estimated from the previous backup)`;
     }
   }
+  updatePowerPause();
   updateFilesNote();
   updateDashboard();
   updateBackupsRunning();
@@ -765,6 +902,9 @@ function updateStatus() {
     loadState({ quiet: true });
   } else if (!state.lastRunning && running) {
     // Make the empty history state explain the run that is in progress.
+    state.speedHistory = [];
+    state.lastSpeedSampleAt = 0;
+    renderTransferSpark();
     renderBackups();
   }
   state.lastRunning = running;
@@ -779,7 +919,13 @@ function updateBackupsRunning() {
     el.textContent = "";
     return;
   }
-  el.textContent = `Backup in progress — ${Number(s.files || 0).toLocaleString()} files scanned, ${fmtBytes(s.bytesUploaded)} uploaded. Browse live progress in Files under Partial current backup; the completed record appears here when the run finishes.`;
+  const speed = Number(s.uploadSpeedBps || 0);
+  const workers = Number(s.uploadTargetThreads || 0);
+  const transfer = speed > 0 ? ` at ${fmtSpeed(speed)}` : "";
+  const concurrency = workers > 0
+    ? ` · ${Number(s.uploadInFlight || 0)}/${workers} uploads active`
+    : "";
+  el.textContent = `Backup in progress — ${Number(s.files || 0).toLocaleString()} files scanned, ${fmtBytes(s.bytesUploaded)} uploaded${transfer}${concurrency}. Browse live progress in Files under Partial current backup; the completed record appears here when the run finishes.`;
   el.classList.remove("hidden");
   el.classList.remove("error");
 }
@@ -1106,6 +1252,19 @@ function renderFiles() {
     } else {
       versionsCell = '<td class="versions-cell muted">—</td>';
     }
+    const inspectBlocked = actionBusy || !!state.status?.editing;
+    const inspectTitle = inspectBlocked ? "Wait for the current file action to finish" : "";
+    const canInspect = !entry.isDir && !entry.isSymlink;
+    const showContent = canInspect
+      ? (inspectBlocked
+          ? `<button class="link-button" type="button" disabled title="${inspectTitle}">Show content</button>`
+          : `<button class="link-button" type="button" data-files-content="${esc(entry.path)}" title="Show the file content">Show content</button>`)
+      : "";
+    const showDiff = canInspect
+      ? (inspectBlocked
+          ? `<button class="link-button" type="button" disabled title="${inspectTitle}">Diff</button>`
+          : `<button class="link-button" type="button" data-files-diff="${esc(entry.path)}" title="${partial ? "Compare this partial file with the latest completed backup" : "Compare this file with the previous revision"}">Diff</button>`)
+      : "";
     const restore = restoreBlocked
       ? '<button class="link-button" type="button" disabled title="Stop the active backup or restore before restoring">Restore</button>'
       : `<button class="link-button" type="button" data-files-restore="${esc(entry.path)}" title="Choose which version to restore">Restore</button>`;
@@ -1127,7 +1286,7 @@ function renderFiles() {
       <td>${size}</td>
       <td>${modified}</td>
       ${versionsCell}
-      <td><div class="files-actions">${restore}${ignore}${remove}</div></td>
+      <td><div class="files-actions">${showContent}${showDiff}${restore}${ignore}${remove}</div></td>
     </tr>`;
   }).join("");
 }
@@ -1240,9 +1399,12 @@ function openFilesDir(path) {
 async function ignoreFilesEntry(path) {
   if (demo || !invoke) return toast("Preview mode — file actions are not available.", true);
   if (!path) return;
-  const ok = window.confirm(
-    `Ignore "${path}" in future backups?\n\nExisting backups are not changed.`
-  );
+  const ok = await confirmAction({
+    title: "Ignore this path?",
+    message: `Ignore "${path}" in future backups?`,
+    detail: "Existing backups are not changed. You can remove the exclude pattern later in Settings.",
+    confirmLabel: "Ignore path",
+  });
   if (!ok) return;
   try {
     const added = await invoke("ignore_backup_entry", { path });
@@ -1272,12 +1434,19 @@ async function removeFilesEntry(path) {
   if (state.status?.running || state.status?.restoring || state.status?.editing || state.filesActionBusy) {
     return toast("Stop the active backup or restore before removing files.", true);
   }
-  const ok = window.confirm(
-    `Remove "${path}" from this backup revision?\n\n` +
-      "This cannot be undone. Other backup revisions keep their copy. " +
-      "Use Ignore to skip it in future backups."
-  );
-  if (!ok) return;
+  const authed = await authorizeSensitive("remove");
+  if (!authed) return;
+  const ok = await confirmAction({
+    title: "Remove from this revision?",
+    message: `Remove "${path}" from this backup revision?`,
+    detail: "This cannot be undone. Other backup revisions keep their copy. Use Ignore to skip it in future backups.",
+    confirmLabel: "Remove",
+    danger: true,
+  });
+  if (!ok) {
+    await clearSensitiveAuthorization();
+    return;
+  }
   state.filesActionBusy = true;
   renderFiles();
   try {
@@ -1442,6 +1611,19 @@ async function restoreSelectedVersion() {
   if (!destination) return toast("Choose a destination folder first.", true);
   const path = state.restorePath || "";
   const partial = state.restorePartial;
+  const version = (state.restoreVersions || []).find(
+    (item) => item.recordKey === state.restoreSelectedKey
+  );
+  const when = partial
+    ? "the partial backup"
+    : (version?.timestamp ? fmtDate(version.timestamp) : "the selected version");
+  const ok = await confirmAction({
+    title: "Restore this version?",
+    message: `Restore ${path || "the entire backup"} from ${when}?`,
+    detail: `Destination: ${destination}\nExisting files may be overwritten.`,
+    confirmLabel: "Restore",
+  });
+  if (!ok) return;
   $("files-dest").value = destination;
   closeRestoreDialog();
   $("files-progress").classList.remove("hidden");
@@ -1474,14 +1656,17 @@ async function restoreEntireFiles() {
   if (!partial && !state.backups.length) return toast("No completed backup is available yet.", true);
   const destination = restoreDestinationValue();
   if (!destination) return toast("Choose a destination folder first.", true);
-  if (!partial) {
-    const record = state.backups.find((entry) => entry.key === state.filesRecordKey) || state.backups[0];
-    const when = record ? fmtDate(record.timestamp) : "latest backup";
-    const ok = window.confirm(
-      `Restore every file from the ${when} backup into:\n${destination}\n\nExisting files may be overwritten.`
-    );
-    if (!ok) return;
-  }
+  const record = partial
+    ? null
+    : (state.backups.find((entry) => entry.key === state.filesRecordKey) || state.backups[0]);
+  const when = partial ? "the partial backup" : (record ? fmtDate(record.timestamp) : "latest backup");
+  const ok = await confirmAction({
+    title: "Restore entire backup?",
+    message: `Restore every file from ${when}?`,
+    detail: `Destination: ${destination}\nExisting files may be overwritten.`,
+    confirmLabel: "Restore everything",
+  });
+  if (!ok) return;
   $("files-progress").classList.remove("hidden");
   $("files-phase").textContent = partial ? "Restoring partial backup…" : "Starting whole backup restore…";
   $("files-stats").textContent = "";
@@ -1584,15 +1769,94 @@ function closeFileDiff() {
   state.fileDiff = null;
 }
 
+function closeFileContent() {
+  state.contentRequest += 1;
+  $("content-modal").classList.add("hidden");
+}
+
+function renderFileContent(content, context = {}) {
+  const partial = context.partial ?? (state.filesRecordKey === "partial");
+  const recordKey = context.recordKey ?? state.filesRecordKey;
+  const record = state.backups.find((entry) => entry.key === recordKey) || state.backups[0];
+  const where = partial
+    ? (state.status?.running ? "in-progress backup" : "partial backup")
+    : (record ? `revision ${fmtDate(record.timestamp)}` : "latest revision");
+  $("content-title").textContent = content.path;
+  $("content-meta").textContent = `${fmtBytes(content.size)} · ${where}`;
+  const note = $("content-note");
+  if (content.message) {
+    note.textContent = content.message;
+    note.classList.remove("hidden");
+  } else {
+    note.textContent = "";
+    note.classList.add("hidden");
+  }
+  if (content.text == null) {
+    const excluded = content.binary || content.tooLarge;
+    $("content-body").innerHTML = `<div class="diff-unavailable">
+      <div class="diff-unavailable-icon" aria-hidden="true">…</div>
+      <p>${esc(content.message || "This file has no text content to show.")}</p>
+      ${excluded ? '<span class="muted small">Binary and large files are intentionally excluded from previews.</span>' : ""}
+    </div>`;
+    return;
+  }
+  const lines = content.text.split("\n");
+  if (lines.length && lines[lines.length - 1] === "") lines.pop();
+  if (lines.length === 1 && lines[0] === "") lines.length = 0;
+  if (!lines.length) {
+    $("content-body").innerHTML = '<div class="version-empty">This file is empty.</div>';
+    return;
+  }
+  const rows = lines.map((line, index) =>
+    `<tr><td class="ln" aria-hidden="true">${index + 1}</td><td class="code">${line === "" ? "&nbsp;" : esc(line)}</td></tr>`
+  ).join("");
+  $("content-meta").textContent += ` · ${lines.length.toLocaleString()} line${lines.length === 1 ? "" : "s"}`;
+  $("content-body").innerHTML = `<table class="content-lines"><tbody>${rows}</tbody></table>`;
+}
+
+async function openFileContent(path) {
+  if (demo || !invoke) return toast("Preview mode — file content needs the macOS build.", true);
+  const partial = state.filesRecordKey === "partial";
+  const recordKey = state.filesRecordKey || null;
+  const requestId = ++state.contentRequest;
+  $("content-modal").classList.remove("hidden");
+  $("content-title").textContent = path;
+  $("content-meta").textContent = "Loading file content…";
+  $("content-note").textContent = "";
+  $("content-note").classList.add("hidden");
+  $("content-body").innerHTML = '<div class="version-empty">Loading content…</div>';
+  try {
+    const result = partial
+      ? await invoke("read_partial_file_content", { path })
+      : await invoke("read_backup_file_content", {
+          recordKey,
+          path,
+        });
+    if (requestId !== state.contentRequest) return;
+    renderFileContent(result, { partial, recordKey });
+  } catch (e) {
+    if (requestId !== state.contentRequest) return;
+    $("content-meta").textContent = "Could not load file content.";
+    $("content-body").innerHTML = `<div class="version-empty">${esc(e)}</div>`;
+  }
+}
+
 function renderFileDiff(diff) {
+  const partial = diff.recordKey === "partial";
+  const running = !!state.status?.running;
+  const partialLabel = running ? "in-progress" : "partial";
   const leftLabel = diff.previousTimestamp
-    ? `Older — ${fmtDate(diff.previousTimestamp)}`
-    : "Older version";
-  const rightLabel = `Newer — ${fmtDate(diff.recordTimestamp)}`;
+    ? `${partial ? "Completed" : "Older"} — ${fmtDate(diff.previousTimestamp)}`
+    : (partial ? "No completed baseline" : "Older version");
+  const rightLabel = partial ? `${running ? "In-progress" : "Partial"} — current` : `Newer — ${fmtDate(diff.recordTimestamp)}`;
   $("file-diff-title").textContent = diff.path;
-  $("file-diff-meta").textContent = diff.previousTimestamp
-    ? `Comparing ${fmtDate(diff.previousTimestamp)} with ${fmtDate(diff.recordTimestamp)}.`
-    : "No older version exists; the file is shown as added.";
+  $("file-diff-meta").textContent = partial
+    ? (diff.previousTimestamp
+        ? `Comparing the latest completed backup (${fmtDate(diff.previousTimestamp)}) with the ${partialLabel} backup.`
+        : `No completed backup exists; the ${partialLabel} file is shown as added.`)
+    : (diff.previousTimestamp
+        ? `Comparing ${fmtDate(diff.previousTimestamp)} with ${fmtDate(diff.recordTimestamp)}.`
+        : "No older version exists; the file is shown as added.");
   const note = $("file-diff-note");
   const rows = diff.rows || [];
   if (!rows.length) {
@@ -1610,6 +1874,11 @@ function renderFileDiff(diff) {
   $("file-diff-legend").classList.remove("hidden");
   if (diff.message) {
     note.textContent = diff.message;
+    note.classList.remove("hidden");
+  } else if (partial) {
+    note.textContent = running
+      ? "The in-progress side reflects files completed so far and may still change."
+      : "The partial side reflects files captured by the interrupted run.";
     note.classList.remove("hidden");
   } else {
     note.textContent = "";
@@ -1634,9 +1903,14 @@ function renderFileDiff(diff) {
     `<table class="side-diff"><colgroup><col class="diff-ln-col" /><col /><col class="diff-ln-col" /><col /></colgroup><thead><tr><th colspan="2">${esc(leftLabel)}</th><th colspan="2">${esc(rightLabel)}</th></tr></thead><tbody>${rowHtml}</tbody></table>`;
 }
 
-async function openFileDiff(path) {
+async function openFileDiff(path, options = {}) {
   if (demo || !invoke) return toast("Preview mode — the file diff needs the macOS build.", true);
-  if (!state.diff?.recordKey) return;
+  const partial = !!options.partial;
+  const record = options.record ?? state.diff?.recordKey;
+  const previous = Object.prototype.hasOwnProperty.call(options, "previous")
+    ? options.previous
+    : (state.diff?.previousRecordKey ?? null);
+  if (!partial && !record) return;
   const requestId = ++state.fileDiffRequest;
   state.fileDiff = null;
   $("file-diff-modal").classList.remove("hidden");
@@ -1647,11 +1921,9 @@ async function openFileDiff(path) {
   $("file-diff-legend").classList.remove("hidden");
   $("file-diff-body").innerHTML = '<div class="version-empty">Loading file contents…</div>';
   try {
-    const result = await invoke("diff_backup_file", {
-      record: state.diff.recordKey,
-      previous: state.diff.previousRecordKey || null,
-      path,
-    });
+    const result = partial
+      ? await invoke("diff_partial_file", { path })
+      : await invoke("diff_backup_file", { record, previous, path });
     if (requestId !== state.fileDiffRequest) return;
     state.fileDiff = result;
     renderFileDiff(result);
@@ -1672,11 +1944,14 @@ async function refreshLogs() {
 
 async function refreshSnapshots() {
   if (demo) return;
+  const generation = state.destinationGeneration;
   try {
     const res = await invoke("list_snapshots");
+    if (generation !== state.destinationGeneration) return;
     state.snapshots = res.snapshots || [];
     $("snapshot-summary").textContent = `${state.snapshots.length} local snapshot(s)`;
   } catch (e) {
+    if (generation !== state.destinationGeneration) return;
     $("snapshot-summary").textContent = String(e);
   }
 }
@@ -1794,13 +2069,20 @@ async function setupEvents() {
         next.bytesScanned = Number(p.bytesScanned ?? p.bytes_scanned ?? 0);
       } else if (p.kind === "upload") {
         next.bytesUploaded = Number(next.bytesUploaded || 0) + Number(p.bytes || 0);
+      } else if (p.kind === "transfer") {
+        next.uploadSpeedBps = Number(p.speed_bps);
+        next.uploadTargetThreads = Number(p.target_threads);
+        next.uploadMaxThreads = Number(p.max_threads);
+        next.uploadInFlight = Number(p.in_flight);
       }
       state.status = next;
       updateStatus();
     },
     "backup-finished": async () => {
+      const generation = state.destinationGeneration;
       const wasPartial = state.filesRecordKey === "partial";
       await loadState({ quiet: true });
+      if (generation !== state.destinationGeneration) return;
       if (wasPartial && $("view-files")?.classList.contains("active")) {
         state.filesEntries = [];
         state.filesError = "";
@@ -1813,6 +2095,19 @@ async function setupEvents() {
     },
     "backup-cancelled": () => {
       toast("Backup cancelled");
+    },
+    "backup-paused": async (e) => {
+      toast(String(e.payload?.message || "Backup paused for power conditions"));
+      if (!demo && invoke) {
+        const generation = state.destinationGeneration;
+        try {
+          const res = await invoke("get_status");
+          if (generation !== state.destinationGeneration || res.selectedProvider !== selectedProvider()) return;
+          state.operationActive = !!res.operationActive;
+          state.status = res.status || state.status;
+          updateStatus();
+        } catch (_) { /* poll will retry */ }
+      }
     },
     "restore-progress": (e) => {
       const p = e.payload || {};
@@ -1943,7 +2238,31 @@ function bind() {
     $("encryption-password").placeholder = "Enter a password for the new backup set";
     toast("New backup set UUID generated — review encryption settings and save.");
   });
+  $("power-pause-cancel").addEventListener("click", async () => {
+    if (demo) return toast("Preview mode");
+    const ok = await confirmAction({
+      title: "Cancel the paused backup?",
+      message: "Do not resume this backup automatically?",
+      detail: "Already uploaded data stays available. Automatic backups will remain paused until you re-enable them.",
+      confirmLabel: "Don't resume",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await invoke("cancel_power_pause");
+      await poll();
+      toast("Paused backup cancelled");
+    } catch (e) { toast(String(e), true); }
+  });
   $("cancel-run").addEventListener("click", async () => {
+    const ok = await confirmAction({
+      title: "Cancel backup?",
+      message: "Cancel the running backup?",
+      detail: "Already uploaded data is kept. The next run resumes from the saved progress.",
+      confirmLabel: "Cancel backup",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await invoke("cancel_backup");
       state.status = {
@@ -1964,10 +2283,7 @@ function bind() {
     try {
       const saved = await invoke("save_config", { config: gatherConfig() });
       if (generation !== state.destinationGeneration) return;
-      state.settingsDrafts.delete(selectedProvider());
-      state.settingsDirty = false;
-      state.config = saved;
-      state.estimateAt = 0;
+      acceptSavedConfig(saved);
       toast("Settings saved");
       await loadState({ quiet: true });
     } catch (e) { toast(String(e), true); }
@@ -1998,22 +2314,21 @@ function bind() {
   });
   $("test-connection").addEventListener("click", async () => {
     if (demo) return toast("Preview mode — no S3 connection.");
-    const generation = state.destinationGeneration;
+    let generation = state.destinationGeneration;
     const out = $("test-result");
     out.textContent = "Testing…";
     out.className = "test-result";
     try {
       const saved = await invoke("save_config", { config: gatherConfig() });
       if (generation !== state.destinationGeneration) return;
-      state.settingsDrafts.delete(selectedProvider());
-      state.settingsDirty = false;
-      state.config = saved;
-      state.estimateAt = 0;
+      acceptSavedConfig(saved);
+      generation = state.destinationGeneration;
       const msg = await invoke("test_connection");
+      if (generation !== state.destinationGeneration) return;
+      await loadState({ quiet: true });
       if (generation !== state.destinationGeneration) return;
       out.textContent = msg;
       out.className = "test-result ok";
-      refreshDestinationCheck();
     } catch (e) {
       if (generation !== state.destinationGeneration) return;
       out.textContent = String(e);
@@ -2045,6 +2360,21 @@ function bind() {
       openFilesDir(open.getAttribute("data-files-open"));
       return;
     }
+    const content = event.target.closest("[data-files-content]");
+    if (content) {
+      openFileContent(content.getAttribute("data-files-content"));
+      return;
+    }
+    const fileDiff = event.target.closest("[data-files-diff]");
+    if (fileDiff) {
+      const path = fileDiff.getAttribute("data-files-diff");
+      if (state.filesRecordKey === "partial") {
+        openFileDiff(path, { partial: true });
+      } else {
+        openFileDiff(path, { record: state.filesRecordKey || "latest", previous: null });
+      }
+      return;
+    }
     const versions = event.target.closest("[data-files-versions]");
     if (versions) {
       openRestoreDialog(versions.getAttribute("data-files-versions"));
@@ -2064,6 +2394,17 @@ function bind() {
     if (remove) removeFilesEntry(remove.getAttribute("data-files-remove"));
   });
   $("files-cancel").addEventListener("click", async () => {
+    const restoring = !!state.status?.restoring;
+    const ok = await confirmAction({
+      title: restoring ? "Cancel restore?" : "Cancel backup?",
+      message: restoring ? "Cancel the running restore?" : "Cancel the running backup?",
+      detail: restoring
+        ? "Files already written to the destination remain there."
+        : "Already uploaded data is kept. The next run resumes from the saved progress.",
+      confirmLabel: restoring ? "Cancel restore" : "Cancel backup",
+      danger: true,
+    });
+    if (!ok) return;
     try { await invoke("cancel_backup"); } catch (e) { toast(String(e), true); }
   });
   $("files-dest-pick").addEventListener("click", () => pickRestoreDestination("files-dest"));
@@ -2081,11 +2422,21 @@ function bind() {
   $("diff-kind").addEventListener("change", renderDiff);
   $("diff-table").addEventListener("click", (event) => {
     const target = event.target.closest("[data-diff-file]");
-    if (target) openFileDiff(target.getAttribute("data-diff-file"));
+    if (target) openFileDiff(target.getAttribute("data-diff-file"), { record: state.diff.recordKey, previous: state.diff.previousRecordKey || null });
   });
   $("file-diff-close").addEventListener("click", closeFileDiff);
   $("file-diff-modal").addEventListener("click", (event) => {
     if (event.target === $("file-diff-modal")) closeFileDiff();
+  });
+  $("content-close").addEventListener("click", closeFileContent);
+  $("content-modal").addEventListener("click", (event) => {
+    if (event.target === $("content-modal")) closeFileContent();
+  });
+  $("confirm-close").addEventListener("click", () => closeConfirm(false));
+  $("confirm-cancel").addEventListener("click", () => closeConfirm(false));
+  $("confirm-accept").addEventListener("click", () => closeConfirm(true));
+  $("confirm-modal").addEventListener("click", (event) => {
+    if (event.target === $("confirm-modal")) closeConfirm(false);
   });
   $("restore-close").addEventListener("click", closeRestoreDialog);
   $("restore-cancel").addEventListener("click", closeRestoreDialog);
@@ -2104,6 +2455,14 @@ function bind() {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
+    if (!$("confirm-modal").classList.contains("hidden")) {
+      closeConfirm(false);
+      return;
+    }
+    if (!$("content-modal").classList.contains("hidden")) {
+      closeFileContent();
+      return;
+    }
     if (!$("file-diff-modal").classList.contains("hidden")) {
       closeFileDiff();
       return;
@@ -2117,6 +2476,14 @@ function bind() {
   $("refresh-logs").addEventListener("click", refreshLogs);
   $("clear-logs").addEventListener("click", async () => {
     if (demo) return;
+    const ok = await confirmAction({
+      title: "Clear activity log?",
+      message: "Clear the on-disk activity log?",
+      detail: "This does not affect any backup data.",
+      confirmLabel: "Clear log",
+      danger: true,
+    });
+    if (!ok) return;
     try { await invoke("clear_logs"); await refreshLogs(); } catch (e) { toast(String(e), true); }
   });
   $("open-log").addEventListener("click", () => {
@@ -2135,7 +2502,19 @@ function bind() {
   });
   $("delete-set").addEventListener("click", async () => {
     if (demo) return toast("Preview mode");
-    if (!window.confirm("Delete all objects in this backup set? This cannot be undone.")) return;
+    const authed = await authorizeSensitive("delete_set");
+    if (!authed) return;
+    const ok = await confirmAction({
+      title: "Delete the entire backup set?",
+      message: "Delete every object in this backup set?",
+      detail: "This cannot be undone. All backup records and referenced data will be removed.",
+      confirmLabel: "Delete everything",
+      danger: true,
+    });
+    if (!ok) {
+      await clearSensitiveAuthorization();
+      return;
+    }
     try {
       const n = await invoke("delete_backup_set");
       toast(`Deleted ${n} objects`);
@@ -2216,7 +2595,39 @@ function demoBackups() {
   });
 }
 
+function setupModalScrollLock() {
+  let locked = false;
+  let savedScrollY = 0;
+  const apply = () => {
+    const open = [...document.querySelectorAll(".modal-backdrop")].some(
+      (el) => !el.classList.contains("hidden")
+    );
+    if (open === locked) return;
+    locked = open;
+    if (open) {
+      // The document element is the actual scrolling container in WebKit, so
+      // locking <body> alone still lets the page scroll behind a modal. A fixed
+      // body plus a negative top keeps the background visually in place.
+      savedScrollY = window.scrollY || document.documentElement.scrollTop || 0;
+      document.documentElement.classList.add("modal-open");
+      document.body.classList.add("modal-open");
+      document.body.style.top = `-${savedScrollY}px`;
+    } else {
+      document.documentElement.classList.remove("modal-open");
+      document.body.classList.remove("modal-open");
+      document.body.style.top = "";
+      window.scrollTo(0, savedScrollY);
+    }
+  };
+  const observer = new window.MutationObserver(apply);
+  document.querySelectorAll(".modal-backdrop").forEach((el) => {
+    observer.observe(el, { attributes: true, attributeFilter: ["class"] });
+  });
+  apply();
+}
+
 async function init() {
+  setupModalScrollLock();
   bind();
   await setupEvents();
   await loadState();

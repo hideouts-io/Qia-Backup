@@ -123,6 +123,27 @@
             <span class="progress-eta" id="progress-eta"></span>
             <span class="progress-percent" id="progress-percent"></span>
           </div>
+          <div class="transfer-panel">
+            <div class="transfer-top">
+              <div class="transfer-speed">
+                <span class="transfer-label">Transfer</span>
+                <strong id="progress-speed">—</strong>
+              </div>
+              <div class="transfer-meta">
+                <span id="progress-transfer">Waiting for uploads…</span>
+                <span id="progress-workers"></span>
+              </div>
+            </div>
+            <div class="transfer-spark" id="transfer-spark" aria-hidden="true"></div>
+          </div>
+        </div>
+
+        <div class="power-pause card hidden" id="power-pause">
+          <div class="power-pause-copy">
+            <strong>Backups paused</strong>
+            <p class="muted small" id="power-pause-message"></p>
+          </div>
+          <button class="button" id="power-pause-cancel" type="button">Don't resume</button>
         </div>
 
         <div class="stat-grid">
@@ -521,6 +542,35 @@ Users/you/Projects"></textarea>
       </div>
       <div class="file-diff-note muted small hidden" id="file-diff-note"></div>
       <div class="file-diff-body" id="file-diff-body">Loading…</div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="content-modal" role="dialog" aria-modal="true" aria-labelledby="content-title">
+    <div class="modal content-modal card">
+      <div class="card-head">
+        <div>
+          <h3 id="content-title">File content</h3>
+          <p class="muted small" id="content-meta">Loading…</p>
+        </div>
+        <button class="link-button" id="content-close">Close</button>
+      </div>
+      <div class="file-diff-note muted small hidden" id="content-note"></div>
+      <div class="content-body" id="content-body">Loading…</div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+    <div class="modal confirm-modal card">
+      <div class="card-head">
+        <h3 id="confirm-title">Confirm action</h3>
+        <button class="link-button" id="confirm-close" type="button">Close</button>
+      </div>
+      <p class="confirm-message" id="confirm-message"></p>
+      <p class="muted small confirm-detail" id="confirm-detail"></p>
+      <div class="modal-actions">
+        <button class="button" id="confirm-cancel" type="button">Cancel</button>
+        <button class="button primary" id="confirm-accept" type="button">Confirm</button>
+      </div>
     </div>
   </div>
 
